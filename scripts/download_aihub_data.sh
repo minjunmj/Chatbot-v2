@@ -28,7 +28,7 @@ AIHUB_API_KEY 환경변수가 필요합니다.
 2. AI Hub 오픈 API 페이지에서 API Key를 발급받으세요.
 3. 아래처럼 실행하세요.
 
-   AIHUB_API_KEY='발급받은-키' ./scripts/download_aihub_data.sh
+   AIHUB_API_KEY='2DAEB1F1-4451-4B72-99DA-E1C32161B67D' ./scripts/download_aihub_data.sh
 EOF
   exit 1
 fi
