@@ -75,6 +75,33 @@ CaseWhisper/
 ```
 ---
 
+## AI Hub 판례 데이터 다운로드
+
+[AI Hub의 생성형AI 법률/규정 텍스트 분석 데이터(고도화) - 상황에 따른 판례 데이터](https://www.aihub.or.kr/aihubdata/data/view.do?dataSetSn=71723)
+(데이터셋 키 `71723`)는 용량과 이용 조건 때문에 Git에 포함하지 않습니다. 새 서버에서는
+저장소를 받은 뒤 다음 순서로 다운로드합니다.
+
+1. AI Hub 데이터셋 페이지에서 다운로드를 신청하고 승인을 받습니다.
+2. [AI Hub 오픈 API 페이지](https://www.aihub.or.kr/devsport/apishell/list.do)에서 API Key를 발급받습니다.
+3. 프로젝트 루트에서 아래 명령을 실행합니다.
+
+```bash
+AIHUB_API_KEY='2DAEB1F1-4451-4B72-99DA-E1C32161B67D' ./scripts/download_aihub_data.sh
+```
+
+데이터는 프로젝트의 `data/`에 저장되며 Git에서 자동으로 제외됩니다. 다운로드가 완료된
+상태에서 스크립트를 다시 실행하면 중복 다운로드를 건너뜁니다. 다시 내려받아야 한다면 다음을
+실행합니다.
+
+```bash
+AIHUB_API_KEY='2DAEB1F1-4451-4B72-99DA-E1C32161B67D' ./scripts/download_aihub_data.sh --force
+```
+
+> API Key를 `.env`, 소스 코드 또는 Git 저장소에 저장하지 마세요. AI Hub 공식 다운로더는
+> 압축 해제 과정까지 수행하므로 데이터 용량의 2~3배에 해당하는 여유 디스크 공간이 필요합니다.
+
+---
+
 ## 🔍 RAG 파이프라인 상세
 
 ### 3단계 검색 과정

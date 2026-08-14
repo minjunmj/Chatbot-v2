@@ -41,6 +41,8 @@ ios/
 
 # ---- 기타 ----
 .env
+/data/
+/.tools/
 __pycache__/
 *.pyc
 *.pyo
