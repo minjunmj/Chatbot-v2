@@ -86,15 +86,22 @@ CaseWhisper/
 3. 프로젝트 루트에서 아래 명령을 실행합니다.
 
 ```bash
-AIHUB_API_KEY='2DAEB1F1-4451-4B72-99DA-E1C32161B67D' ./scripts/download_aihub_data.sh
+AIHUB_API_KEY='발급받은-키' ./scripts/download_aihub_data.sh
 ```
 
-데이터는 프로젝트의 `data/`에 저장되며 Git에서 자동으로 제외됩니다. 다운로드가 완료된
-상태에서 스크립트를 다시 실행하면 중복 다운로드를 건너뜁니다. 다시 내려받아야 한다면 다음을
-실행합니다.
+데이터는 프로젝트의 `data/`에 저장되며 Git에서 자동으로 제외됩니다. 다운로드가 끝나면
+`data/` 아래의 ZIP 파일도 각각의 ZIP이 위치한 폴더에 자동으로 압축 해제합니다. 원본 ZIP은
+삭제하지 않습니다. 다운로드가 완료된 상태에서 스크립트를 다시 실행하면 중복 다운로드를
+건너뜁니다. 다시 내려받아야 한다면 다음을 실행합니다.
 
 ```bash
-AIHUB_API_KEY='2DAEB1F1-4451-4B72-99DA-E1C32161B67D' ./scripts/download_aihub_data.sh --force
+AIHUB_API_KEY='발급받은-키' ./scripts/download_aihub_data.sh --force
+```
+
+이미 다운로드된 ZIP 파일만 압축 해제하려면 API Key 없이 실행할 수 있습니다.
+
+```bash
+./scripts/download_aihub_data.sh --extract-only
 ```
 
 > API Key를 `.env`, 소스 코드 또는 Git 저장소에 저장하지 마세요. AI Hub 공식 다운로더는
