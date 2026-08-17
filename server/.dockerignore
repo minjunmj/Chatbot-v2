@@ -1,8 +1,0 @@
-__pycache__/
-*.pyc
-*.log
-.env
-temp/
-store/
-data/
-model_bs32/
