@@ -32,3 +32,23 @@
 - **확인된 현재 상태**: `server/model_test.py`(Qwen3-Embedding-0.6B / BGE-M3 / KURE-v1
   dense retrieval 비교) 작성은 되어 있으나 `cache_embeddings/` 결과 없음 → 아직 미실행
   상태로 진행 중
+
+## 2026-08-17 — GitHub 저장소 Chatbot-v2로 이전, v1 산출물 삭제
+
+- **저장소 이전**: 기존 `minjunmj/Rag_Chatbot`(Public)은 그대로 두고, 새 저장소
+  `minjunmj/Chatbot-v2`(Public)를 만들어 기존 커밋 히스토리(A~"data", 총 14개)를 그대로
+  push. 로컬 `origin`도 새 저장소로 전환. V1 종료 지점에는 `v1-final` 태그를 남겨서
+  "여기까지가 v1"을 명확히 표시함 (커밋 `1aeb4d3`)
+- **git 계정 정보 정리**: 커밋 작성자가 macOS 계정 정보로 자동 채워져 있던 것을 확인하고
+  `user.name=박민준`, `user.email=dhfkzlfj@naver.com`으로 전역 설정. 이미 push된 첫 V2
+  커밋도 amend + force-push로 작성자 정보를 맞춤
+- **v1 산출물 삭제**: 처음부터 새로 시작하기로 하면서 v1의 완성된 결과물을 저장소에서
+  제거 — Flutter 모바일 앱 전체(android/, lib/, web/, windows/, test/, pubspec*,
+  analysis_options.yaml, .metadata), Docker 배포 설정(Dockerfile, docker-compose.yml,
+  .dockerignore), FastAPI 서버 코드(main.py, acc_test.py), v1 의존성 목록
+  (server/requirements.txt), v1 소개 README.md
+  - 코드 자체는 사라지지 않고 `v1-final` 태그에 남아있음 (필요하면
+    `git checkout v1-final -- <path>`로 복원 가능)
+  - 유지한 것: `data/`, `docs/`, `scripts/`(데이터 파이프라인), `.tools/`(AIHub 다운로드
+    도구), `server/model_test.py`(진행 중인 임베딩 비교) — v2에서도 계속 쓰는 것들
+- 상세: PROJECT_STATE.md 2절 갱신

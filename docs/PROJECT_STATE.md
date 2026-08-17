@@ -47,10 +47,12 @@ vector DB 구축으로 넘어갈 수 있음.
 ## 2. v1-baseline (이전 시도 — 폐기하고 처음부터 다시 하는 중, 참고용으로만 보존)
 
 `server/main.py`, `server/acc_test.py`, `README.md`, `lib/main.dart`(Flutter 앱),
-`Dockerfile`/`docker-compose.yml`은 **이전 시도(v1)의 결과물**이다. 지금 진행 중인 작업과는
-별개이며, "이미 이만큼 구현했었다"는 참고 자산일 뿐 현재 상태가 아니다.
+`Dockerfile`/`docker-compose.yml` 등 v1 결과물은 **저장소에서 삭제됨** (2026-08-17,
+[log.md](log.md) 참고). 지금 작업 트리에는 없고, git 히스토리의 `v1-final` 태그
+(`git show v1-final:server/main.py` 식으로 조회 가능)에서만 볼 수 있음. 재사용하려면
+그 태그에서 필요한 파일만 `git checkout v1-final -- <path>`로 꺼내 쓸 것.
 
-v1이 실제로 구현했던 것 (재사용 검토 대상):
+v1이 실제로 구현했던 것 (재사용 검토 대상 — 코드는 v1-final 태그에 있음):
 - FastAPI 서버 + Flutter 모바일 앱 (음성 질문 → Whisper STT → 답변)
 - FAISS + fine-tuned HuggingFace 임베딩(`model_bs32`) + BM25 앙상블 실험(acc_test.py)
 - 3단계 검색: FAISS top-50 → MMR(λ=0.9) 다양성 10개 → CrossEncoder(`bge-reranker-v2-m3`) rerank top-3
