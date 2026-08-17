@@ -38,6 +38,7 @@ ios/
 /server/model/
 /server/model_bs32/
 /server/cache/
+/server/cache_embeddings/
 
 # ---- 기타 ----
 .env
@@ -48,3 +49,4 @@ __pycache__/
 *.pyo
 *.log
 recorded.aac
+.DS_Store
