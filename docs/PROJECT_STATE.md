@@ -7,7 +7,7 @@
 > "1. 지금 당장 상태"와 "5. 다음 계획"을 최신으로 고쳐쓸 것. 이 두 가지를 안 하면 다음
 > 세션이 다시 헤맨다.
 
-최종 갱신: 2026-08-17
+최종 갱신: 2026-08-18
 
 ---
 
@@ -31,16 +31,21 @@
 | 데이터 파이프라인 (parsing/cleaning/split) | ✅ 완료 — `scripts/build_train_val_dataset.py` v3 |
 | DB_data (검색 대상 원본 코퍼스) | ✅ 44,700건 (`data/DB_data/*.json`) |
 | Train/Val 쿼리셋 | ✅ `data/Train/train_query.json`, `data/Val/val_query.json` |
-| Chunking / Metadata 설계 | ❌ 미결정 (보류 중, [data_preprocessing_log.md](data_preprocessing_log.md) 3절) |
-| 임베딩 모델 선정 실험 | 🔄 **진행 중** — `server/model_test.py`, 아직 실행 결과 없음 (`cache_embeddings/` 비어있음) |
+| Chunking / Metadata 설계 | ⚠️ chunk 크기 후보 확정(200<500<1000 성능 단조), **최종 크기만 미결정** (비용 트레이드오프 검토 필요, [data_preprocessing_log.md](data_preprocessing_log.md) 3절) |
+| 임베딩 모델 선정 실험 (no-chunk) | ✅ 완료 — `server/model_test.py`, **KURE-v1 선정** (결과: [log.md](log.md) 2026-08-18) |
+| Chunk 기반 retrieval 실험 (jhgan) | ✅ 완료 — `server/jhgan.py`(chunk_size=200), no-chunk KURE-v1보다 전 지표 우세하나 **모델+chunking 동시 변경이라 confound 있음** (결과: [log.md](log.md) 2026-08-18) |
+| Hybrid(dense+sparse) 실험 (BGE-M3) | ✅ 완료 — `server/bge_hybrid.py`, hybrid가 dense/sparse 단독보다 뚜렷이 우세하나 KURE-v1 no-chunk엔 못 미침 (결과: [log.md](log.md) 2026-08-18) |
+| Chunking 효과 isolate 실험 (KURE-v1 chunk) | ✅ 완료 — `server/kure_chunk.py`(200/500/1000자), **confound 해소: chunking이 지배적 요인**, chunk200이 압도적 1위(recall@1 0.5541, mrr@10 0.661)이나 비용(823,763 chunk, encode 2시간)도 최대 (결과: [log.md](log.md) 2026-08-18) |
 | Vector DB 구축 | ❌ 시작 전 |
-| Retriever 평가 자동화 | ❌ 시작 전 (model_test.py는 임시 스크립트, 정식 평가 하니스 아님) |
+| Retriever 평가 자동화 | ❌ 시작 전 (model_test.py/jhgan.py/bge_hybrid.py는 임시 스크립트, 정식 평가 하니스 아님) |
 | RAG 답변 생성 파이프라인 | ❌ 시작 전 (v1 코드 있으나 재사용 여부 미결정, 아래 2절 참고) |
 | 백엔드/배포/운영 | ❌ 시작 전 (v1 코드 있음, 아래 2절 참고) |
 
-**한 줄 요약**: 데이터 준비는 끝났고, 지금은 "어떤 임베딩 모델을 쓸지"를 3개 모델
-(Qwen3-Embedding-0.6B, BGE-M3, KURE-v1) 비교로 결정하는 단계. 이 결과가 나와야 chunking →
-vector DB 구축으로 넘어갈 수 있음.
+**한 줄 요약**: 데이터 준비는 끝났고, no-chunk 기준 임베딩 모델 비교(3개)는 끝나서 KURE-v1을
+선정함. KURE-v1 고정 + chunk 크기별(200/500/1000) isolate 실험까지 끝나서 jhgan 실험의
+confound가 해소됐고, chunking이 성능에 지배적으로 기여한다는 게 확인됨(chunk200이 no-chunk
+대비 recall@1 +0.153p). 이제 남은 건 "정확도 대 비용(encode 시간·chunk 개수·DB 용량)"
+트레이드오프를 보고 최종 chunk 크기를 정하는 것 — 이게 끝나야 vector DB 구축으로 넘어감.
 
 ---
 
@@ -168,18 +173,40 @@ LLM App Engineer 프로젝트로서 합리적인 순서. 아래는 **원안 그�
 
 ## 5. 다음 계획 (Next Step)
 
-**지금 할 일**: `server/model_test.py` 실행 완료해서 `cache_embeddings/results.json` 확보
-(Qwen3-Embedding-0.6B / BGE-M3 / KURE-v1의 Recall@1/5/10/20, MRR@10 비교).
+**지금 할 일**: chunk 크기 최종 결정 (200/500/1000 중, 또는 그 사이 값 추가 검증) — 아직
+미결정.
 
-**근거**: 이후 모든 실험(chunking, hybrid search, reranker)이 "어떤 임베딩 모델 위에서"
-진행되는지에 의존함. 지금 이 비교가 안 끝나면 Phase 1의 나머지(Chunking/Metadata/Vector DB)와
-Phase 2 실험을 시작할 기준선 자체가 없음. GPU 서버 대여 중이므로 이번 세션에 끝내는 게 효율적.
+**근거**: `server/kure_chunk.py`로 KURE-v1을 고정하고 chunk 크기(200/500/1000자)만 바꿔서
+isolate 실험한 결과(2026-08-18, [log.md](log.md) 참고), jhgan 실험의 confound가 해소되고
+chunking 자체가 성능에 지배적으로 기여함이 확인됨:
 
-**결과 나온 뒤 순서**:
-1. 승자 모델 선정 → [log.md](log.md)에 결과 표+선정 근거 기록
-2. Chunking 전략 결정 (Phase 1 남은 체크박스) — 승자 모델의 max_seq_length 제약을 고려해서 설계
-3. 정식 Vector DB 구축 (FAISS 유지 vs pgvector 결정 포함)
-4. 재사용 가능한 평가 하니스로 정리 (Phase 2 실험에 계속 쓸 것이므로)
+| chunk_size | recall@1 | mrr@10 | num_chunks | encode_time |
+|---|---|---|---|---|
+| 200 | 0.5541 | 0.661 | 823,763 | 7367.7s (≈2h) |
+| 500 | 0.4995 | 0.6044 | 343,033 | 3537.2s (≈59m) |
+| 1000 | 0.4402 | 0.5387 | 182,533 | 2732.9s (≈46m) |
+| (no-chunk baseline) | 0.4012 | 0.4941 | — | — |
+
+정확도만 보면 200이 압도적이지만, chunk 개수가 no-chunk 대비 약 18배로 늘어나 encode
+시간·vector DB 용량·검색 latency가 그만큼 커짐 — 아직 이 비용을 실제로 감당 가능한지
+따져보지 않았음. 이 트레이드오프를 판단해서 최종 크기를 정해야 Chunking/Metadata 설계가
+끝나고 Vector DB 구축으로 넘어갈 수 있음.
+
+**참고**: BGE-M3 hybrid(dense+sparse, bge_hybrid.py) 실험도 완료됨 — hybrid가 dense/sparse
+단독보다는 뚜렷이 낫지만(recall@1 0.3707 vs 0.3115/0.3026) KURE-v1 no-chunk에는 아직 못
+미침(0.4012). 다만 이제 chunking 자체가 훨씬 큰 폭(chunk200 기준 +0.153p)으로 기여한다는 게
+확인됐으므로, hybrid보다 chunking 전략 확정이 우선순위가 높음. KURE-v1은 sparse 출력을
+지원하지 않아 이 hybrid 방식을 그대로 적용할 순 없음 — 필요해지면 BM25와의 hybrid를 별도로 검토.
+
+**다음 순서**:
+1. chunk 크기 최종 결정 (200 그대로 채택 / 비용 절충안(예: 300~400자) 추가 검증 / 다른 방식
+   — 문단 단위 등 — 검토) → 결정 근거 log.md에 기록
+2. Chunking 전략 최종 확정 (Phase 1 남은 체크박스) — chunk 방식(고정 길이 vs 문단 단위),
+   overlap 여부까지 함께 결정
+3. 정식 Vector DB 구축 (FAISS 유지 vs pgvector 결정 포함, chunk 개수가 많을수록 이 결정이
+   중요해짐)
+4. 재사용 가능한 평가 하니스로 정리 (Phase 2 실험에 계속 쓸 것이므로) — model_test.py/jhgan.py/
+   kure_chunk.py 모두 임시 스크립트이므로 이 시점에 통합
 
 ---
 
