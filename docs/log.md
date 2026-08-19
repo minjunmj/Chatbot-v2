@@ -163,3 +163,111 @@
 - **다음**: chunk_size 최종 결정 — 정확도만 보면 200이 압도적이지만, 실서비스 latency/DB
   용량까지 고려해서 최종 크기를 정할지, 아니면 성능 우선으로 200을 그대로 채택할지 결정 필요.
   결정 후 Vector DB 구축(FAISS vs pgvector)으로 진행.
+
+## 2026-08-19 — Vector DB를 pgvector로 결정, DB 구축 파이프라인 준비
+
+- **FAISS vs pgvector 검토 후 pgvector 선택**: 법률 판례 검색은 "법원명/사건종류명/선고일자로
+  필터 + 의미 검색"을 같이 쓸 가능성이 높은데, FAISS는 메타데이터 필터를 자체 지원하지 않아
+  직접 구현해야 함. pgvector는 SQL `WHERE` + `ORDER BY embedding <=> ...`로 한 쿼리에서 결합
+  가능. 또한 PROJECT_STATE.md 3절에 이미 있던 "Phase 4에서 PostgreSQL 쓸 계획"과도 인프라가
+  통합됨. chunk200 기준 82만 벡터 규모는 FAISS만의 성능 우위가 필요한 스케일이 아니라고 판단.
+- **디스크 정리**: 선정 안 된 모델(qwen3-embedding-0.6b, bge-m3, jhgan-ko-sbert-sts)의 임베딩
+  캐시(.npy/.npz)와 HF 모델 가중치를 삭제해 디스크 여유 8G → 20G로 확보. KURE-v1 모델과
+  chunk200/500/1000 임베딩 캐시는 chunk 크기 결정에 아직 필요해서 보존.
+- **train 데이터 미사용 확인**: model_test.py/jhgan.py/bge_hybrid.py/kure_chunk.py 4개 실험
+  스크립트 전부 `val_query.json`만 참조, `train_query.json`은 지금까지 한 번도 사용 안 됨
+  (grep으로 확인).
+- **Postgres 16 + pgvector 0.6.0 설치**: 이 인스턴스(Vast 컨테이너, systemd 없음)에 apt로
+  설치 후 supervisor 서비스(`postgres`)로 등록해 foreground 프로세스로 관리(`postgres` OS
+  유저로 실행, `/opt/supervisor-scripts/postgres.sh`). DB `lexchatbot` 생성, `vector` extension
+  활성화. 접속정보는 `server/.env`의 `DATABASE_URL`.
+- **적재 파이프라인 작성** (`server/db/`):
+  - `schema.sql` — `chunks_200`/`chunks_500`/`chunks_1000` 테이블. 필드는 사건번호/사건명/
+    법원명/선고일자/사건종류명(metadata) + chunk_text + embedding(VECTOR(1024))만 포함하기로
+    결정 — 판시사항/판결요지/판결유형/선고 등은 제외(판례내용 chunk만 검색 대상으로 확정,
+    data_preprocessing_log.md 3절의 "보류 중"이었던 context/metadata 구분이 이 범위로 일부 정리됨)
+  - `build_vector_db.py` — kure_chunk.py가 저장한 임베딩 캐시(.npy)는 벡터만 저장하고 chunk
+    텍스트/사건번호는 저장 안 해서, 원본 JSON을 kure_chunk.py와 **동일한 순서/로직**으로
+    재처리해 chunk 텍스트+metadata를 재생성한 뒤 캐시된 벡터와 인덱스를 맞춰 매칭. 재임베딩
+    없이(GPU 불필요) COPY로 벌크 적재 후 HNSW 인덱스 생성.
+  - `test_val_pgvector.py` — val_query.json으로 (1) recall@k/mrr@10이 kure_chunk.py의 numpy
+    exact-search 결과와 근접한지 sanity check, (2) 쿼리당 검색 latency(mean/p50/p95) 측정.
+    chunk 크기 최종 결정에 쓸 latency 실측 자료.
+- **chunk1000으로 파이프라인 검증**: 182,533행 적재(kure_chunk.py 실험 때의 chunk 개수와
+  정확히 일치 — 매핑 정상 확인). 적재 126.8초, HNSW 인덱스 빌드 754.3초, 테이블+인덱스 용량
+  2,662MB (사전 어림 계산 ~2.2GB와 비슷한 수준).
+- **다음**: chunk200/500도 같은 스크립트로 적재(사용자가 직접 실행) → 세 크기 모두
+  test_val_pgvector.py로 latency 측정 → 정확도/용량/latency 종합해서 chunk 크기 최종 결정.
+
+## 2026-08-19 — pgvector 실측 검증 결과 (chunk200 vs chunk1000), chunk200 쪽으로 기움
+
+- **chunk200 적재 중 디스크 위기**: 인덱스 빌드 도중 여유 공간이 1.2GB까지 떨어짐(예상보다
+  chunk200 실제 용량이 훨씬 큼). 이미 DB에 적재가 끝나 더는 필요 없어진
+  `kure-v1_chunk200_corpus.npy`(1.6G) 캐시를 삭제해 즉시 여유 확보, 빌드는 문제없이 완료됨.
+- **test_val_pgvector.py 초기 버그 발견+수정**: `DISTINCT ON (case_no)` 사용 시 Postgres 문법상
+  `ORDER BY`가 case_no로 시작해야 하는데, 그러면 LIMIT이 벡터 거리 순이 아니라 사건번호(문자열)
+  순으로 잘려서 사실상 무작위에 가까운 후보군을 가져오는 버그였음(첫 실행 때 chunks_200
+  recall@1이 0.0034로 나와서 발견). CTE로 "① HNSW로 진짜 최근접 500개를 먼저 뽑고 ② 그 안에서만
+  case_no dedupe"하도록 수정 후 재검증.
+- **pgvector(HNSW) 실측 결과** — kure_chunk.py의 numpy exact-search 대비 전 지표에서 1~2%p
+  낮게 나옴(ANN 근사 탐색이므로 정상적인 손실):
+
+| chunk_size | recall@1 | recall@5 | recall@10 | recall@20 | mrr@10 | latency mean | latency p99 | DB 용량(테이블+인덱스) |
+|---|---|---|---|---|---|---|---|---|
+| 200 (pgvector) | 0.5433 | 0.7905 | 0.8577 | 0.9021 | 0.6487 | 7.73ms | 12.63ms | 11 GB |
+| 1000 (pgvector) | 0.4293 | 0.6503 | 0.7341 | 0.8019 | 0.5259 | 6.78ms | 10.66ms | 2.66 GB |
+| (참고) 200 exact | 0.5541 | 0.8048 | 0.8734 | 0.9192 | 0.661 | - | - | - |
+| (참고) 1000 exact | 0.4402 | 0.6659 | 0.7522 | 0.8209 | 0.5387 | - | - | - |
+
+- **트레이드오프 판단**:
+  - **latency는 사실상 무승부**: chunk200이 데이터 4.5배 많은데도 mean 기준 0.95ms, p99 기준
+    2ms 차이 — HNSW가 데이터 크기에 sub-linear하게 스케일함을 실측으로 확인. 사람이 체감할
+    수준이 아님.
+  - **정확도는 chunk200이 뚜렷하게 우세**: recall@1 +11.4%p(상대 +26.5%), mrr@10 +12.3%p.
+  - **향후 rerank를 붙여도 이 격차는 유지됨**: rerank는 retrieval이 이미 뽑아온 top-k 안에서만
+    재정렬 가능 — retrieval의 recall@k가 rerank 이후 최종 정확도의 상한선이 됨. recall@20
+    기준 chunk1000은 쿼리의 19.8%가 애초에 top-20에 정답이 없어서(chunk200은 9.8%) rerank로도
+    구제 불가능. 즉 rerank 도입 여부와 무관하게 chunk 크기 선택은 여전히 중요.
+  - **용량은 chunk200이 4.1배 비싸지만(11GB vs 2.66GB)**, 절대량 자체는 실서비스 서버 기준
+    감당 못할 수준은 아니라고 판단.
+  - → 위 종합으로 **chunk200 쪽으로 결론이 기움** (chunk500은 테스트하지 않고 스킵, 이하 참고)
+- **디스크 정리**: chunk1000 관련 자원(Postgres `chunks_1000` 테이블, `kure-v1_chunk1000_corpus.npy`
+  캐시) 삭제 — 결과 수치는 위 표로 기록해뒀으므로 원본 데이터/DB는 더 안 남겨둠.
+- **다음**: chunk200을 최종 chunk 크기로 확정할지 마지막 결정만 남음 (PROJECT_STATE.md 갱신 예정).
+
+## 2026-08-19 — overlap 실험 (chunk200_overlap50 / chunk300 / chunk300_overlap100), chunk200 결론 재검토
+
+- **동기**: chunk200(overlap 없음)으로 기울었던 결정이 dense 단독 기준이었고, chunk_size 다음으로
+  안 본 하이퍼파라미터(overlap)가 있어서 추가 검토. `server/kure_chunk_overlap.py` 작성 —
+  kure_chunk.py와 동일한 exact-search 방식(pgvector 빌드 없이 numpy로 빠르게 스크리닝),
+  chunk_document에 overlap 지원 추가(`step = chunk_size - overlap`, chunk 길이 자체는 고정).
+  디스크 절약을 위해 설정마다 임베딩 캐시를 지우려던 초기 설계는, DB 빌드(HNSW 인덱스)와 달리
+  npy 자체는 가볍다는 걸 확인하고 **끝까지 보존하는 방식으로 변경**(재인코딩 낭비 방지).
+- **결과** (val_query.json 7,280개, exact search):
+
+| config | recall@1 | recall@5 | recall@10 | recall@20 | mrr@10 | num_chunks | encode_time |
+|---|---|---|---|---|---|---|---|
+| chunk200 (overlap 없음, 기존) | 0.5541 | 0.8048 | 0.8734 | 0.9192 | 0.661 | 823,763 | 7367.7s |
+| **chunk200_overlap50** | **0.5848** | 0.8321 | 0.8912 | 0.9372 | **0.6899** | 1,090,921 | 10282.1s |
+| chunk300_overlap0 | 0.5422 | 0.7896 | 0.8595 | 0.9087 | 0.647 | 556,578 | 5179.6s |
+| **chunk300_overlap100** | **0.5826** | 0.8236 | 0.8861 | 0.9304 | **0.6849** | **823,763** | 7833.1s |
+
+- **분석**:
+  - overlap 추가가 뚜렷하게 유효함(chunk200_overlap50이 chunk200 대비 recall@1 +3.07%p —
+    pgvector 근사 오차(~1.1%p)보다 3배 커서 노이즈로 보기 어려움).
+  - overlap 없이 chunk_size만 300으로 키우면 오히려 나빠짐(chunk300_overlap0 recall@1 0.5422 <
+    chunk200 0.5541) — 기존 "짧을수록 좋다" 경향과 일치, chunk_size 확대 자체는 손해.
+  - **chunk300_overlap100이 chunk200과 chunk 개수가 정확히 동일(823,763)** — 즉 같은 DB
+    용량/latency 비용으로 recall@1 +2.85%p를 추가로 얻는 결과. "공짜 개선"에 가까움.
+  - chunk200_overlap50(최고 정확도, chunk 32% 더 많음) vs chunk300_overlap100(정확도 거의
+    동률 -0.22%p, chunk 24.5% 더 적음) — 이 둘의 차이는 pgvector 근사 오차 범위 안이라 exact
+    search만으로는 우열 확정 불가.
+  - 캐시 보존됨: `kure-v1_chunk200_overlap50_corpus.npy`(2.08GB), `kure-v1_chunk300_overlap100_corpus.npy`
+    (1.57GB) — 재인코딩 없이 pgvector 빌드에 재사용 가능. `kure-v1_chunk300_overlap0_corpus.npy`
+    (1.06GB)는 결론에서 밀려서 참고용으로만 유지.
+- **결정**: chunk200(overlap 없음) 단독 확정은 보류. chunk200_overlap50 vs chunk300_overlap100
+  **둘 다 실제 pgvector에 적재해서 latency/용량까지 포함한 최종 비교** 진행하기로 함. 기존
+  `chunks_200`(overlap 없는 버전) 테이블은 이 비교를 위해 삭제.
+- **다음**: `build_vector_db.py`에 overlap 지원 추가(파일명 규칙 + chunk_document) →
+  `chunks_200_overlap50`, `chunks_300_overlap100` 두 테이블 빌드 → `test_val_pgvector.py`로
+  각각 recall/latency 실측 → 최종 chunk 전략 확정.
