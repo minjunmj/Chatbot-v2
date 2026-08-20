@@ -3,13 +3,16 @@
 인코딩해서 val_query.json 기준 recall@k/mrr@10을 계산한다 — kure_chunk_overlap.py와 동일한
 exact-search(numpy) 방법론이라 지금까지의 chunk300_overlap100 실험 결과와 직접 비교 가능.
 
-파인튜닝된 모델은 임베딩 자체가 달라지므로, 기존 chunks_300_overlap100 pgvector 테이블의
-캐시된 벡터를 재사용할 수 없음 — 이 스크립트는 매번 코퍼스를 새로 인코딩한다(chunk300_overlap100
-기준 이전 실측으로 약 65분 소요).
+파인튜닝된 모델은 가중치가 달라져서 임베딩도 달라지므로 코퍼스를 새로 인코딩해야 하지만
+(chunk300_overlap100 기준 실측 약 2시간 10분/7833초), **base KURE-v1은 이미
+kure_chunk_overlap.py가 만든 kure-v1_chunk300_overlap100_corpus.npy가 정확히 이 코퍼스를
+base 모델로 인코딩한 결과라 그대로 재사용**한다 — 재인코딩 없이 몇 초 만에 로드됨.
+그 외 임의 모델(파인튜닝 체크포인트 등)은 최초 1회 인코딩 후 캐시해서, 같은 모델로 재평가할
+때는 다시 빠르게 돈다.
 
 사용법:
-    python eval_model.py --model-path nlpai-lab/KURE-v1                        # base 모델
-    python eval_model.py --model-path ./output/kure-v1-finetuned-inbatch       # 파인튜닝 결과
+    python eval_model.py --model-path nlpai-lab/KURE-v1                        # base 모델 (캐시 재사용, 빠름)
+    python eval_model.py --model-path ./output/kure-v1-finetuned-inbatch       # 파인튜닝 결과 (최초 1회만 느림)
 """
 import argparse
 import gc
@@ -29,6 +32,10 @@ from sentence_transformers import SentenceTransformer
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # server/
 DB_DIR = os.path.join(BASE_DIR, "..", "data", "DB_data")
 VAL_PATH = os.path.join(BASE_DIR, "..", "data", "Val", "val_query.json")
+CACHE_DIR = os.path.join(BASE_DIR, "cache_embeddings")
+
+BASE_REPO = "nlpai-lab/KURE-v1"
+BASE_MODEL_CACHE = os.path.join(CACHE_DIR, "kure-v1_chunk300_overlap100_corpus.npy")  # kure_chunk_overlap.py 산출물
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 CHUNK_SIZE = 300
@@ -106,6 +113,13 @@ def encode_all(model, texts, batch_size):
     return embs
 
 
+def cache_path_for(model_path):
+    if model_path == BASE_REPO:
+        return BASE_MODEL_CACHE
+    safe_name = model_path.strip("/").replace("/", "_").replace(os.sep, "_")
+    return os.path.join(CACHE_DIR, f"eval_{safe_name}_chunk300_overlap100_corpus.npy")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", required=True,
@@ -119,18 +133,35 @@ def main():
     val_data = load_val()
     print(f"평가 쿼리 수: {len(val_data)}")
 
-    print(f"모델 로딩: {args.model_path}")
-    model = SentenceTransformer(args.model_path, device=DEVICE,
-                                 model_kwargs={"torch_dtype": torch.float16} if DEVICE == "cuda" else None)
-    model.max_seq_length = MAX_SEQ_LENGTH
-
     chunk_texts, chunk_case_ids = build_chunks(case_ids, doc_texts)
     print(f"chunk 개수: {len(chunk_texts)}")
     chunk_case_ids = np.array(chunk_case_ids)
 
-    t0 = time.time()
-    doc_embs = l2norm(encode_all(model, chunk_texts, CORPUS_BATCH_SIZE).astype(np.float32))
-    encode_time = time.time() - t0
+    cache_path = cache_path_for(args.model_path)
+    if os.path.exists(cache_path):
+        print(f"코퍼스 임베딩 캐시 재사용: {cache_path} (재인코딩 없음)")
+        t0 = time.time()
+        doc_embs = l2norm(np.load(cache_path).astype(np.float32))
+        encode_time = time.time() - t0
+        assert doc_embs.shape[0] == len(chunk_texts), (
+            f"캐시 row 수({doc_embs.shape[0]})와 재생성된 chunk 수({len(chunk_texts)})가 안 맞음 — "
+            f"{cache_path}가 다른 chunk 설정으로 만들어졌을 수 있음")
+        model = SentenceTransformer(args.model_path, device=DEVICE,
+                                     model_kwargs={"torch_dtype": torch.float16} if DEVICE == "cuda" else None)
+        model.max_seq_length = MAX_SEQ_LENGTH
+    else:
+        print(f"모델 로딩: {args.model_path}")
+        model = SentenceTransformer(args.model_path, device=DEVICE,
+                                     model_kwargs={"torch_dtype": torch.float16} if DEVICE == "cuda" else None)
+        model.max_seq_length = MAX_SEQ_LENGTH
+
+        t0 = time.time()
+        doc_embs = l2norm(encode_all(model, chunk_texts, CORPUS_BATCH_SIZE).astype(np.float32))
+        encode_time = time.time() - t0
+
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        np.save(cache_path, doc_embs.astype(np.float16))  # 디스크 절반으로 절약 (kure_chunk_overlap.py 캐시와 동일 정밀도)
+        print(f"코퍼스 임베딩 캐시 저장: {cache_path} (다음 평가 시 재사용됨)")
 
     query_embs = l2norm(model.encode(
         [item["query"] for item in val_data], batch_size=QUERY_BATCH_SIZE, show_progress_bar=True,

@@ -385,3 +385,117 @@ Phase 2 첫 작업으로 KURE-v1 도메인 파인튜닝 설계를 논의하고 1
     전후 비교용
 - **다음**: 사용자가 `prepare_data.py` → `train.py` 실행 → `eval_model.py`로 base vs
   파인튜닝 비교. 이후 hard negative 채굴 방식 결정해서 2단계 진행.
+
+## 2026-08-20 — Phase A(in-batch negative) 파인튜닝 결과, Phase B(hard negative) 착수
+
+- **Phase A 결과 — 확실한 개선 확인** (base KURE-v1 exact search vs 파인튜닝 후, val_query.json
+  7,280개, chunks_300_overlap100 코퍼스 기준):
+
+| | base (exact) | Phase A (in-batch) | 차이 |
+|---|---|---|---|
+| recall@1 | 0.5826 | **0.6574** | **+7.48%p** (상대 +12.8%) |
+| recall@5 | 0.8236 | 0.8776 | +5.40%p |
+| recall@10 | 0.8861 | 0.9262 | +4.01%p |
+| recall@20 | 0.9304 | 0.9622 | +3.18%p |
+| mrr@10 | 0.6849 | **0.7519** | +6.70%p |
+
+  - in-batch negative만으로도 전 지표에서 뚜렷한 개선 — 도메인 파인튜닝이 유효함을 확인.
+  - 지난번 우려했던 "positive chunk 근사 라벨링(정답 문서 내 최고 유사도 chunk 선택)이
+    심각하게 잘못됐으면 어쩌나" 하는 리스크도, 이렇게 일관된 개선이 나온 것 자체가 그 방법론이
+    실제로 크게 잘못되진 않았다는 간접 증거로 봄 (라벨이 심하게 틀렸다면 이 정도 개선은
+    나오기 어려움).
+- **eval_model.py 디스크 이슈 발견+수정**: 파인튜닝 모델 평가 시 코퍼스 캐시를 float32로
+  저장해서(3.37GB, base 캐시는 fp16이라 1.69GB였음) 디스크가 다시 위험 수준(1.9GB)까지
+  떨어짐. 기존 캐시는 fp16으로 재저장해서 절반으로 줄이고, 스크립트도 앞으로 fp16으로
+  저장하도록 수정.
+- **eval_model.py base 모델 캐시 재사용 버그도 수정**: 원래 매번 재인코딩하도록 짜여있었는데
+  (~2시간 10분 소요, 이전에 "65분"이라고 잘못 안내했던 것도 정정 — index 빌드 시간과 혼동),
+  base KURE-v1은 `kure_chunk_overlap.py`가 만든 기존 캐시(`kure-v1_chunk300_overlap100_corpus.npy`)
+  가 정확히 같은 걸 재사용하면 되므로 캐시 재사용 로직 추가. 파인튜닝 체크포인트 등 다른
+  모델도 최초 1회만 인코딩 후 캐시.
+- **Phase B(hard negative) 설계+구현**:
+  - **채굴 기준 모델은 Phase A 결과물** — base 모델로 채굴하면 Phase A가 이미 고친 부분까지
+    또 negative로 잡아 학습 신호가 낭비되므로, "지금 모델이 헷갈려하는 것"을 반영하기 위해
+    Phase A 모델로 채굴.
+  - `mine_hard_negatives.py` 신설 — 전체 코퍼스(82만 chunk)에서 학습 쿼리와 유사도 상위
+    100개(`--search-pool`) 중 정답 문서가 아닌 것 중 상위 1개(`--num-negatives`)를 hard
+    negative로 채택. eval_model.py가 Phase A 평가 시 만들어둔 코퍼스 캐시를 재사용해서
+    재인코딩 없음. 5개 샘플로 검증 완료 — 전부 정답과 무관한 다른 문서에서 정상적으로
+    negative를 찾음.
+  - `train.py`를 확장해서 `--pairs-file`에 hard_negative_chunk 필드가 있으면 자동으로
+    (anchor, positive, negative) 3열 데이터셋으로 학습하고, **시작점도 base가 아니라 Phase A
+    결과 모델**로 자동 전환(처음부터 다시 학습하는 게 아니라 Phase A 위에 이어서 학습) —
+    output도 `kure-v1-finetuned-hard`로 분리해 Phase A 결과와 별도 보존.
+- **다음**: 사용자가 `mine_hard_negatives.py` → `train.py --pairs-file finetune_pairs_hard.jsonl`
+  → `eval_model.py`로 Phase A vs Phase B 비교.
+
+## 2026-08-20 — Phase B 1차 시도 실패(OOM) → 수정 → Phase B 결과가 Phase A보다 나빠짐 → 원인 수정
+
+- **OOM 발생+수정**: `train.py`를 batch_size=32(Phase A와 동일 기본값)로 처음 실행했을 때
+  CUDA OOM(24GB 꽉 참). hard negative가 있으면 배치당 텍스트 3개(anchor/positive/negative)를
+  인코딩해야 해서 Phase A(2개)보다 메모리를 더 씀 — `train.py`에 phase별 기본값 분리 추가
+  (hard negative 있으면 batch_size 기본 32→16) + `gradient_checkpointing=True` 추가.
+- **Phase B 1차 결과 — Phase A보다 전 지표에서 나쁘게 나옴**:
+
+| | Phase A (in-batch) | Phase B 1차 (hard negative) | 차이 |
+|---|---|---|---|
+| recall@1 | 0.6574 | 0.6231 | **-3.43%p** |
+| recall@5 | 0.8776 | 0.8489 | -2.87%p |
+| recall@10 | 0.9262 | 0.9033 | -2.29%p |
+| recall@20 | 0.9622 | 0.9401 | -2.21%p |
+| mrr@10 | 0.7519 | 0.7205 | **-3.14%p** |
+
+- **원인 분석**: train_query.json의 case_ids가 전부 1개씩이라(41,319건 확인) multi-label
+  누락 버그는 아님. 유력한 원인은 **`mine_hard_negatives.py`가 유사도 최상위 1개를 그대로
+  hard negative로 썼다는 것** — hard negative 개념을 처음 논의할 때 "너무 상위(1~2위)는
+  false negative 위험이 있어 5~30위권에서 고르는 경우도 많다"고 짚었었는데, 정작 구현에서는
+  이 안전장치를 빠뜨렸었음. 법률 판례는 같은 법리를 인용하는 표준 문구·유사 사건 유형이
+  많아서, "정답 문서는 아니지만 유사도 1위"인 chunk가 실제로도 상당히 관련 있는 내용일 위험이
+  이 도메인에서 특히 큼. 부차적으로 계속 학습(Phase A 위에 같은 학습률로 3 epoch 추가)로 인한
+  과적합/드리프트 가능성도 배제 못함.
+- **수정**:
+  - `mine_hard_negatives.py`에 `--skip-top`(기본 5) 추가 — 유사도 순위 1~5위는 건너뛰고
+    6위부터 negative로 채택해 false negative 위험 완화. 3개 샘플로 전/후 비교 검증 완료.
+  - `train.py`: Phase B 기본 학습률 2e-5→**5e-6**(계속 학습이라 더 보수적으로), 기본
+    epoch 3→**1**(과적합 위험 완화)로 낮춤. 전부 phase별 기본값 자동 분기(직접 override 가능).
+- **다음**: `mine_hard_negatives.py` 재실행(새 skip_top 적용) → `train.py --pairs-file
+  finetune_pairs_hard.jsonl` 재학습 → `eval_model.py`로 재평가, Phase A/Phase B 1차와 비교.
+
+## 2026-08-20 — 재사용 가능한 평가 하니스 신설 (`server/eval/`)
+
+- **배경**: model_test.py/jhgan.py/bge_hybrid.py/kure_chunk.py/kure_chunk_overlap.py/
+  test_val_pgvector.py/finetune/eval_model.py 7개 스크립트가 전부 "val_query.json 로딩 →
+  검색 → recall@k/mrr@10 계산 → 출력"을 매번 새로 구현하고 있었음 — sparse/hybrid/rerank를
+  계속 실험하려면 이 시점에 정리하는 게 이후 시간을 아껴줌(PROJECT_STATE.md Phase 1 로드맵에
+  이미 예정돼있던 항목). query rewriting은 이번 스코프에서 제외하기로 함.
+- **구조**:
+  - `harness.py` — `evaluate(retriever, val_data, ...)` 하나로 recall@k/mrr@10(+선택적
+    latency) 계산. `retriever.retrieve_batch(queries, max_k) -> list[list[str]]` 인터페이스만
+    맞으면 어떤 검색 방법이든 그대로 평가 가능 — 새 검색 기법(sparse, hybrid, rerank) 추가할
+    때 이 파일은 안 건드리고 retrievers.py에 클래스만 추가하면 됨
+  - `retrievers.py` — 지금 당장 필요한 두 가지 구현체:
+    - `DenseExactRetriever` — numpy exact search (kure_chunk.py류가 하던 방식, pgvector 없이
+      빠른 스크리닝용)
+    - `PgvectorRetriever` — 실제 Postgres+pgvector HNSW 검색 (test_val_pgvector.py가 하던
+      CTE 쿼리 패턴 그대로, 실제 서빙 latency까지 측정 가능)
+  - `run_eval.py` — CLI. `--mode exact --model-path ... --chunk-size ... --overlap ...` 또는
+    `--mode pgvector --model-path ... --table ...`. exact 모드는 eval_model.py가 갖고 있던
+    "모델+chunk 설정별 코퍼스 임베딩 캐시 재사용"(fp16 저장, 재인코딩 방지) 기능도 포함시켜서
+    완전히 대체 가능하게 만듦(단, 캐시 파일명 규칙이 기존 스크립트들과 달라서 예전 캐시를
+    자동으로 못 읽음 — 새로 인코딩됨).
+- **검증**: 가짜 소규모 corpus(문서 3개)로 DenseExactRetriever+harness 로직 검증(recall@1=1.0
+  정상), 캐시 저장/재사용 라운드트립 검증, `chunks_300_overlap100` 실제 테이블로 pgvector 모드
+  200개 쿼리 샘플 실행 — 기존 전체 7,280개 결과(recall@1 0.5714)와 비슷한 범위(0.54) 확인.
+- **정리 대상(사용자 판단 필요)**: 아래 스크립트들은 이제 `run_eval.py`로 대체 가능 —
+  결과 수치는 이미 log.md/PROJECT_STATE.md에 다 기록돼 있어서 삭제해도 근거는 안 사라짐.
+  단, bge_hybrid.py는 sparse 검색 로직 자체(하니스의 Retriever로 아직 포팅 안 함)가 남아있어서
+  나중에 SparseRetriever/HybridRetriever 만들 때 참고용으로 남겨둘 가치는 있음:
+  - `server/model_test.py`, `server/jhgan.py`, `server/bge_hybrid.py`
+  - `server/kure_chunk.py`, `server/kure_chunk_overlap.py`
+  - `server/db/test_val_pgvector.py`
+  - `server/finetune/eval_model.py`
+- **다음**: 사용자가 위 목록 중 지울 파일 결정. Phase B(hard negative) 재실행 결과 나오면
+  이제부터는 `run_eval.py`로 평가.
+- **정리 실행**: `model_test.py`, `jhgan.py`, `kure_chunk.py`, `kure_chunk_overlap.py` 삭제.
+  `bge_hybrid.py`(sparse 로직 미포팅이라 참고용 보존), `test_val_pgvector.py`,
+  `finetune/eval_model.py`는 남겨둠(추후 판단).

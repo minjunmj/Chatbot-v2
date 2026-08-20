@@ -39,6 +39,8 @@ ios/
 /server/model_bs32/
 /server/cache/
 /server/cache_embeddings/
+/server/finetune/output/
+/server/finetune/*.jsonl
 
 # ---- 기타 ----
 .env

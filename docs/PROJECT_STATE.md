@@ -37,8 +37,8 @@
 | Hybrid(dense+sparse) 실험 (BGE-M3) | ✅ 완료 — `server/bge_hybrid.py`, hybrid가 dense/sparse 단독보다 뚜렷이 우세하나 KURE-v1 no-chunk엔 못 미침 (결과: [log.md](log.md) 2026-08-18) |
 | Chunking 효과 isolate 실험 (KURE-v1 chunk) | ✅ 완료 — `server/kure_chunk.py`(200/500/1000자), **confound 해소: chunking이 지배적 요인**, chunk200이 압도적 1위(recall@1 0.5541, mrr@10 0.661)이나 비용(823,763 chunk, encode 2시간)도 최대 (결과: [log.md](log.md) 2026-08-18) |
 | Vector DB 구축 | ✅ **1차 완료** — FAISS 대신 PostgreSQL+pgvector 채택, Postgres 16 + supervisor 서비스 등록. `chunks_300_overlap100`(823,763행, 11GB, HNSW 인덱스)이 정식 서빙용 테이블로 확정·유지 중. `server/db/schema.sql`+`build_vector_db.py`+`test_val_pgvector.py`는 chunk_size/overlap 임의 조합 지원하도록 일반화 완료 |
-| 임베딩 모델 도메인 파인튜닝 | 🔶 진행중 — 설계 확정 후 1단계(in-batch negative) 코드 작성 완료: `server/finetune/prepare_data.py`(positive chunk 근사 라벨링) + `train.py`(MultipleNegativesRankingLoss) + `eval_model.py`(base vs 파인튜닝 비교). **아직 실행 전** (사용자가 직접 실행 예정). hard negative는 2단계로 보류 (근거: [log.md](log.md) 2026-08-20) |
-| Retriever 평가 자동화 | ❌ 시작 전 (model_test.py/jhgan.py/bge_hybrid.py는 임시 스크립트, 정식 평가 하니스 아님) |
+| 임베딩 모델 도메인 파인튜닝 | 🔶 진행중 — **Phase A(in-batch negative) 완료**(recall@1 +7.48%p, mrr@10 +6.70%p, base 대비). **Phase B(hard negative) 1차 시도는 오히려 Phase A보다 나쁨**(recall@1 -3.43%p) — 원인은 유사도 최상위 negative를 그대로 써서 생긴 false negative로 추정, `mine_hard_negatives.py`에 `--skip-top`(상위 5개 건너뛰기) 추가 + `train.py` Phase B 기본 lr/epoch 낮춤으로 수정 완료. **재실행 대기 중**. 근거: [log.md](log.md) 2026-08-20 |
+| Retriever 평가 자동화 | ✅ 완료 — `server/eval/`(`harness.py`+`retrievers.py`+`run_eval.py`) 신설. `DenseExactRetriever`/`PgvectorRetriever` 구현, sparse/hybrid/rerank 추가 시 retrievers.py에 클래스만 추가하면 됨. 기존 임시 스크립트 7개는 대체 가능(수치는 log.md에 보존, 삭제 여부는 사용자 판단) — [log.md](log.md) 2026-08-20 |
 | RAG 답변 생성 파이프라인 | ❌ 시작 전 (v1 코드 있으나 재사용 여부 미결정, 아래 2절 참고) |
 | 백엔드/배포/운영 | ❌ 시작 전 (v1 코드 있음, 아래 2절 참고) |
 
@@ -97,12 +97,11 @@ LLM App Engineer 프로젝트로서 합리적인 순서. 아래는 **원안 그�
   - [x] Embedding / Vector DB — KURE-v1 + PostgreSQL/pgvector, `chunks_300_overlap100` 서빙 중
   - ✅ **Vector DB 재선정 완료**: FAISS 대신 pgvector로 통합 (메타데이터 필터+벡터검색 결합, Phase 4 Postgres 계획과 인프라 통합)
 - Retriever 평가 환경 구축
-  - [ ] Query–정답 판례 평가셋 (Val 쿼리셋은 이미 있음, 재사용 가능)
-  - [ ] Recall@k, MRR
-  - [ ] 평가 자동화 — ➕ `model_test.py`/`acc_test.py`처럼 매번 스크립트 새로 쓰지 말고,
-    corpus/query 바꿔 끼우면 되는 **재사용 가능한 평가 하니스**로 한 번만 제대로 만들어두기
-    (Phase 2에서 실험을 계속 돌려야 하므로 여기 투자가 이후 시간을 아껴줌)
-- [ ] Retriever Baseline 구축 (최초 검색 정확도 측정) — model_test.py 결과가 이 역할
+  - [x] Query–정답 판례 평가셋 (Val 쿼리셋은 이미 있음, 재사용 가능)
+  - [x] Recall@k, MRR
+  - [x] 평가 자동화 — `server/eval/`(harness.py+retrievers.py+run_eval.py)로 완료.
+    Retriever 인터페이스만 맞으면 corpus/query/검색방법 바꿔 끼우기만 하면 됨
+- [x] Retriever Baseline 구축 (최초 검색 정확도 측정) — model_test.py 결과가 이 역할
 
 ### Phase 2 — Retriever 성능 개선 (검색 정확도만 집중)
 - [ ] Retriever 성능 개선
@@ -174,9 +173,7 @@ LLM App Engineer 프로젝트로서 합리적인 순서. 아래는 **원안 그�
 
 ## 5. 다음 계획 (Next Step)
 
-**지금 할 일**: 임베딩 모델(KURE-v1) 도메인 파인튜닝 착수 — `train_query.json`(질문–정답
-판례 쌍)으로 contrastive fine-tuning(hard negative 포함). 아직 구체적 방법(라이브러리,
-loss, hard negative 채굴 전략, 평가 계획)이 정해지지 않은 착수 직전 상태.
+**지금 할 일**: Phase B(hard negative) 파인튜닝 실행 → Phase A와 비교 → 최종 임베딩 모델 확정.
 
 **Chunking 최종 결정 요약** (완료, 2026-08-19~20, 상세 근거는 [log.md](log.md)):
 chunk200 → chunk1000 → chunk200_overlap50 → chunk300_overlap100까지 exact search + pgvector
@@ -184,20 +181,30 @@ chunk200 → chunk1000 → chunk200_overlap50 → chunk300_overlap100까지 exac
 정확도 차이(1%p 안팎, recall@1은 0.44%p로 거의 오차 수준)보다 DB 용량 27% 절감(15GB→11GB)의
 실익이 크다고 판단해 채택. latency는 두 후보가 사실상 무승부(웜업 후 재측정 기준).
 
-**파인튜닝 관련 착안점** (아직 결정 안 됨, 다음 세션에서 다룰 것):
-1. **베이스 모델**: KURE-v1(BGE-M3 한국어 튜닝)에서 추가 파인튜닝할지, 처음부터 다른 체크포인트로
-   할지 — KURE-v1이 이미 검증된 baseline이므로 이 위에 얹는 게 자연스러움
-2. **데이터**: `train_query.json`은 `{"query": ..., "case_ids": [...]}` 형태 (val_query.json과
-   동일 포맷) — positive pair는 있으나 **hard negative는 아직 채굴 안 함**. chunks_300_overlap100
-   에서 유사도 높은데 오답인 chunk를 hard negative로 뽑는 절차 필요
-2. **어떤 단위로 학습할지**: 문서 전체 vs chunk 단위 — retrieval이 chunk 단위로 이뤄지므로
-   chunk 단위 파인튜닝이 정합성 있어 보이나, train_query의 정답 라벨은 case_id(문서) 단위라
-   chunk 단위 positive를 어떻게 정할지 결정 필요
-3. **프레임워크**: sentence-transformers의 `MultipleNegativesRankingLoss` 등이 일반적 선택지
-4. **평가**: 파인튜닝 전후를 val_query.json + chunks_300_overlap100 세팅으로 비교해야 "파인튜닝이
-   실제로 유효했는지" 정량적으로 보일 수 있음 (이 프로젝트의 핵심 가치인 "정량적 근거"와 직결)
-5. **GPU 비용**: 지금까지 encode 작업들(chunk300_overlap100만 해도 65분)을 고려하면 파인튜닝은
-   훨씬 오래 걸릴 수 있음 — 스코프를 먼저 정하고 시작하는 게 나을 것
+**파인튜닝 진행 상황** (설계 결정 근거는 [log.md](log.md) 2026-08-20 참고):
+- **Phase A(in-batch negative) 완료** — base 대비 recall@1 +7.48%p(0.5826→0.6574),
+  mrr@10 +6.70%p(0.6849→0.7519), 전 지표 개선 확인. 결과 모델:
+  `server/finetune/output/kure-v1-finetuned-inbatch/`
+- **Phase B(hard negative) 1차 시도 실패 → 원인 수정 → 재실행 대기**:
+  - `mine_hard_negatives.py` — Phase A 모델 기준으로 전체 코퍼스에서 헷갈리는 오답 chunk를
+    채굴. base가 아니라 Phase A 모델로 채굴하는 이유는 "지금 모델이 헷갈려하는 것"을 반영해야
+    학습 신호가 낭비 없이 유효하기 때문
+  - **1차 결과가 Phase A보다 전 지표에서 나쁘게 나옴**(recall@1 -3.43%p) — 유사도 최상위
+    negative를 그대로 써서 false negative(법률 판례 특성상 실제로 관련 있는 내용을 오답으로
+    학습)가 원인으로 추정됨. `--skip-top`(기본 5, 상위 순위 건너뛰기) 추가로 수정,
+    `train.py` Phase B 기본값도 lr 2e-5→5e-6, epoch 3→1로 낮춤(과적합 위험 완화)
+  - `train.py`가 `finetune_pairs_hard.jsonl`(hard_negative_chunk 필드 있음)을 감지하면
+    자동으로 (anchor, positive, negative) 3열 학습 + **Phase A 결과 모델 위에 이어서 학습**
+    (처음부터 재학습 아님) + 출력 경로도 `kure-v1-finetuned-hard`로 분리
+  - 실행 순서(재실행): `mine_hard_negatives.py` → `train.py --pairs-file finetune_pairs_hard.jsonl` →
+    `eval_model.py --model-path ./output/kure-v1-finetuned-hard`로 Phase A/1차 시도와 비교
+- **eval_model.py 관련 주의**: 파인튜닝 모델 평가 시 코퍼스를 매번 재인코딩하지 않고
+  캐시(`cache_embeddings/eval_..._corpus.npy`)를 자동 재사용하도록 고쳐져 있음(최초 1회만
+  느림, 이후 재사용). base 모델은 처음부터 `kure-v1_chunk300_overlap100_corpus.npy`를 재사용.
+  캐시는 fp16으로 저장(용량 절반) — 예전에 fp32로 저장돼 디스크 위기 있었던 것 수정됨.
+- **디스크 관리**: 이 인스턴스(32GB)가 계속 빠듯함 — 파인튜닝 모델 1개(~2.2GB) + 코퍼스 캐시
+  1개(~1.6GB, fp16 기준)당 이 정도씩 잡아먹으므로, Phase B 결과까지 나오면 필요없어진
+  중간 산출물(예: Phase A 평가용 캐시 등)은 정리 권장.
 
 **Vector DB 관련 참고사항**:
 - FAISS 대신 **PostgreSQL+pgvector** 채택 — 이유: (1) 메타데이터 필터(법원명/사건종류명/
