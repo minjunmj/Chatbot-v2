@@ -7,7 +7,7 @@
 > "1. 지금 당장 상태"와 "5. 다음 계획"을 최신으로 고쳐쓸 것. 이 두 가지를 안 하면 다음
 > 세션이 다시 헤맨다.
 
-최종 갱신: 2026-08-19
+최종 갱신: 2026-08-20
 
 ---
 
@@ -31,24 +31,23 @@
 | 데이터 파이프라인 (parsing/cleaning/split) | ✅ 완료 — `scripts/build_train_val_dataset.py` v3 |
 | DB_data (검색 대상 원본 코퍼스) | ✅ 44,700건 (`data/DB_data/*.json`) |
 | Train/Val 쿼리셋 | ✅ `data/Train/train_query.json`, `data/Val/val_query.json` |
-| Chunking / Metadata 설계 | ⚠️ chunk_size는 200이 유력했으나 **overlap 실험에서 뒤집힘** — chunk200_overlap50 / chunk300_overlap100 둘 다 chunk200(overlap 없음) 대비 recall@1 +2.85~3.07%p 우세, 특히 chunk300_overlap100은 **chunk 개수가 기존 chunk200과 동일(823,763)해서 같은 비용에 정확도만 더 얻음** (근거: [log.md](log.md) 2026-08-19). 이 두 후보를 pgvector에 실제 적재해 최종 비교 진행 중 |
+| Chunking / Metadata 설계 | ✅ **최종 확정: chunk_size=300, overlap=100 (글자 단위), KURE-v1 임베딩.** chunk200(overlap 없음) → chunk200_overlap50/chunk300_overlap100 overlap 실험 → 둘 다 pgvector 실측까지 마치고 chunk300_overlap100 채택 (정확도 -1%p 안팎 손해, 용량 -27% 이득, latency 무승부; 근거: [log.md](log.md) 2026-08-20) |
 | 임베딩 모델 선정 실험 (no-chunk) | ✅ 완료 — `server/model_test.py`, **KURE-v1 선정** (결과: [log.md](log.md) 2026-08-18) |
 | Chunk 기반 retrieval 실험 (jhgan) | ✅ 완료 — `server/jhgan.py`(chunk_size=200), no-chunk KURE-v1보다 전 지표 우세하나 **모델+chunking 동시 변경이라 confound 있음** (결과: [log.md](log.md) 2026-08-18) |
 | Hybrid(dense+sparse) 실험 (BGE-M3) | ✅ 완료 — `server/bge_hybrid.py`, hybrid가 dense/sparse 단독보다 뚜렷이 우세하나 KURE-v1 no-chunk엔 못 미침 (결과: [log.md](log.md) 2026-08-18) |
 | Chunking 효과 isolate 실험 (KURE-v1 chunk) | ✅ 완료 — `server/kure_chunk.py`(200/500/1000자), **confound 해소: chunking이 지배적 요인**, chunk200이 압도적 1위(recall@1 0.5541, mrr@10 0.661)이나 비용(823,763 chunk, encode 2시간)도 최대 (결과: [log.md](log.md) 2026-08-18) |
-| Vector DB 구축 | 🔶 진행중 — **FAISS 대신 PostgreSQL+pgvector로 결정** (메타데이터 필터+벡터검색 결합, Phase 4 Postgres 계획과의 통합 고려). Postgres 16 + supervisor 서비스 등록 완료, `server/db/schema.sql`+`build_vector_db.py`+`test_val_pgvector.py` 작성 완료. chunk200/1000 pgvector 비교까지 끝내고 chunk200으로 기울었으나, **이후 overlap 실험으로 chunk200_overlap50 / chunk300_overlap100 두 후보가 더 유력해짐** ([log.md](log.md) 2026-08-19). 기존 `chunks_200`(overlap 없음) 테이블은 이 재비교를 위해 삭제 예정, `build_vector_db.py`에 overlap 지원 추가 후 두 후보를 pgvector에 실제 적재해 최종 비교할 차례 |
+| Vector DB 구축 | ✅ **1차 완료** — FAISS 대신 PostgreSQL+pgvector 채택, Postgres 16 + supervisor 서비스 등록. `chunks_300_overlap100`(823,763행, 11GB, HNSW 인덱스)이 정식 서빙용 테이블로 확정·유지 중. `server/db/schema.sql`+`build_vector_db.py`+`test_val_pgvector.py`는 chunk_size/overlap 임의 조합 지원하도록 일반화 완료 |
+| 임베딩 모델 도메인 파인튜닝 | 🔶 진행중 — 설계 확정 후 1단계(in-batch negative) 코드 작성 완료: `server/finetune/prepare_data.py`(positive chunk 근사 라벨링) + `train.py`(MultipleNegativesRankingLoss) + `eval_model.py`(base vs 파인튜닝 비교). **아직 실행 전** (사용자가 직접 실행 예정). hard negative는 2단계로 보류 (근거: [log.md](log.md) 2026-08-20) |
 | Retriever 평가 자동화 | ❌ 시작 전 (model_test.py/jhgan.py/bge_hybrid.py는 임시 스크립트, 정식 평가 하니스 아님) |
 | RAG 답변 생성 파이프라인 | ❌ 시작 전 (v1 코드 있으나 재사용 여부 미결정, 아래 2절 참고) |
 | 백엔드/배포/운영 | ❌ 시작 전 (v1 코드 있음, 아래 2절 참고) |
 
-**한 줄 요약**: 데이터 준비, 임베딩 모델(KURE-v1), chunking 효과 검증까지 끝났고, Vector DB는
-FAISS 대신 PostgreSQL+pgvector로 결정. chunk200 vs chunk1000 pgvector 비교(latency 거의
-무승부, 정확도는 chunk200 우세)까지 끝내고 chunk200으로 기울었었으나, **이후 overlap을
-추가로 실험해보니 chunk200_overlap50 / chunk300_overlap100 둘 다 chunk200(overlap 없음)보다
-뚜렷이 우세**함을 확인(recall@1 +2.85~3.07%p) — 특히 chunk300_overlap100은 chunk 개수가
-기존 chunk200과 완전히 같아서(823,763개) **같은 비용으로 정확도만 더 얻는** 결과라 chunk200
-단독 확정을 보류함. 지금은 이 두 후보를 pgvector에 실제로 적재해 latency/용량까지 포함한
-최종 비교를 준비 중 — 기존 `chunks_200`(overlap 없음) 테이블은 이를 위해 삭제.
+**한 줄 요약**: 데이터 준비, 임베딩 모델(KURE-v1) 선정, chunking 전략, Vector DB 구축까지
+**Phase 1이 전부 끝남.** chunk_size=300/overlap=100(KURE-v1)로 최종 확정하고
+`chunks_300_overlap100` 테이블이 정식 서빙용으로 pgvector에 살아있는 상태. (chunk200_overlap50과
+막판까지 경합했으나 정확도 차이가 1%p 안팎으로 작아서 용량 27% 절감 쪽을 택함 — 근거
+[log.md](log.md) 2026-08-20). **다음은 Phase 2 — `train_query.json` 기반 임베딩 모델
+도메인 파인튜닝 착수.**
 
 ---
 
@@ -93,11 +92,10 @@ LLM App Engineer 프로젝트로서 합리적인 순서. 아래는 **원안 그�
 - 데이터 파이프라인
   - [x] Parsing
   - [x] Cleaning
-  - [ ] Chunking
-  - [ ] Metadata
-  - [ ] Embedding / Vector DB
-  - ➕ **Vector DB 재선정**: v1은 FAISS였음. Phase 4에서 PostgreSQL을 쓸 계획이라면
-    pgvector로 통합할지, FAISS를 유지할지 지금 결정해두면 나중에 마이그레이션 안 해도 됨.
+  - [x] Chunking — chunk_size=300, overlap=100 확정 ([log.md](log.md) 2026-08-20)
+  - [x] Metadata — 사건번호/사건명/법원명/선고일자/사건종류명만 포함하기로 확정 (`server/db/schema.sql`)
+  - [x] Embedding / Vector DB — KURE-v1 + PostgreSQL/pgvector, `chunks_300_overlap100` 서빙 중
+  - ✅ **Vector DB 재선정 완료**: FAISS 대신 pgvector로 통합 (메타데이터 필터+벡터검색 결합, Phase 4 Postgres 계획과 인프라 통합)
 - Retriever 평가 환경 구축
   - [ ] Query–정답 판례 평가셋 (Val 쿼리셋은 이미 있음, 재사용 가능)
   - [ ] Recall@k, MRR
@@ -114,11 +112,11 @@ LLM App Engineer 프로젝트로서 합리적인 순서. 아래는 **원안 그�
   법조문 번호·고유명사처럼 키워드 매칭이 중요한 도메인이라 dense 단독보다 잘 나올 가능성 높음.
 - ➕ **Reranker 도입 (CrossEncoder)**: v1에서 이미 검증됨(`bge-reranker-v2-m3`). 순수 dense
   대비 성능 향상 폭을 정량적으로 비교해두면 "왜 rerank를 썼는지" 발표 근거가 됨.
-- ➕ **임베딩 모델 도메인 파인튜닝 (선택, 난이도 높음)**: `train_query.json`(질문–정답 판례
-  쌍)이 이미 있어서 contrastive fine-tuning(hard negative 포함)이 가능한 조건. 포트폴리오
-  차별화 포인트로 강력하지만 시간이 걸리므로 baseline 비교 후 시간 남으면 진행.
-- ➕ **Chunking 전략 실험**: Phase 1에서 미룬 chunking을 여기서 결정 — 고정 길이 vs
-  문단/판시사항 단위 vs 재귀적 분할, chunk 크기별 Recall 비교.
+- 🔶 **임베딩 모델 도메인 파인튜닝 — 착수 시작**: `train_query.json`(질문–정답 판례
+  쌍)으로 contrastive fine-tuning(hard negative 포함) 진행 예정. 아직 방법/코드 미정.
+- ✅ **Chunking 전략 실험 완료**: chunk_size 200/500/1000 → overlap 실험(200_overlap50,
+  300, 300_overlap100) → pgvector 실측까지 거쳐 **chunk_size=300/overlap=100 확정**
+  ([log.md](log.md) 2026-08-19~20).
 
 ### Phase 3 — RAG 답변 품질 개선
 - RAG Generation Pipeline 구축
@@ -176,44 +174,30 @@ LLM App Engineer 프로젝트로서 합리적인 순서. 아래는 **원안 그�
 
 ## 5. 다음 계획 (Next Step)
 
-**지금 할 일**: chunk200_overlap50 vs chunk300_overlap100, 이 두 후보를 pgvector에 실제
-적재해서 recall/latency/용량까지 포함한 최종 비교 → chunking 전략 최종 확정.
+**지금 할 일**: 임베딩 모델(KURE-v1) 도메인 파인튜닝 착수 — `train_query.json`(질문–정답
+판례 쌍)으로 contrastive fine-tuning(hard negative 포함). 아직 구체적 방법(라이브러리,
+loss, hard negative 채굴 전략, 평가 계획)이 정해지지 않은 착수 직전 상태.
 
-**경위**: chunk200(overlap 없음) vs chunk1000을 pgvector로 비교했을 때는 chunk200이 뚜렷이
-우세해서(recall@1 +11.4%p, latency는 거의 무승부, [log.md](log.md) 2026-08-19 오전) chunk200
-확정으로 기울었었음. 그런데 이후 chunk_size 다음으로 안 본 하이퍼파라미터인 **overlap**을
-추가 실험해보니, chunk200(overlap 없음) 자체가 최선이 아니었던 것으로 드러남
-([log.md](log.md) 2026-08-19 오후, exact search 기준):
+**Chunking 최종 결정 요약** (완료, 2026-08-19~20, 상세 근거는 [log.md](log.md)):
+chunk200 → chunk1000 → chunk200_overlap50 → chunk300_overlap100까지 exact search + pgvector
+실측을 거쳐 **chunk_size=300, overlap=100** 확정. chunk200_overlap50과 막판 경합했는데
+정확도 차이(1%p 안팎, recall@1은 0.44%p로 거의 오차 수준)보다 DB 용량 27% 절감(15GB→11GB)의
+실익이 크다고 판단해 채택. latency는 두 후보가 사실상 무승부(웜업 후 재측정 기준).
 
-| config | recall@1 | mrr@10 | num_chunks | encode_time |
-|---|---|---|---|---|
-| chunk200 (overlap 없음) | 0.5541 | 0.661 | 823,763 | 7367.7s |
-| **chunk200_overlap50** | **0.5848** | **0.6899** | 1,090,921 | 10282.1s |
-| chunk300_overlap0 | 0.5422 | 0.647 | 556,578 | 5179.6s |
-| **chunk300_overlap100** | **0.5826** | **0.6849** | **823,763** | 7833.1s |
-
-- chunk200_overlap50 / chunk300_overlap100 둘 다 chunk200보다 recall@1이 +2.85~3.07%p
-  높음 — pgvector 근사 오차(~1.1%p)보다 커서 노이즈가 아님.
-- **chunk300_overlap100은 chunk 개수가 기존 chunk200과 완전히 같음(823,763)** → 같은
-  DB 용량/latency 비용으로 정확도만 더 얻는 셈이라 우선순위가 높음.
-- chunk200_overlap50은 정확도가 근소하게 더 높지만(0.22%p, 오차범위 안) chunk이 32% 더 많아
-  DB 용량도 그만큼 커질 것으로 예상(대략 11GB → 14~15GB대로 추정, 아직 실측 전).
-- 이 두 후보의 차이(0.22%p)는 pgvector 근사 오차 범위 안이라 exact search만으로는 우열을
-  못 가림 → 실제 pgvector 적재 후 재확인 필요.
-- 임베딩 캐시(GPU 인코딩 결과)는 재사용 가능하게 보존해둠: `kure-v1_chunk200_overlap50_corpus.npy`
-  (2.08GB), `kure-v1_chunk300_overlap100_corpus.npy`(1.57GB). `kure-v1_chunk300_overlap0_corpus.npy`
-  (1.06GB)는 결론에서 밀려 참고용으로만 유지.
-- 기존 `chunks_200`(overlap 없는 버전) Postgres 테이블은 이 재비교를 위해 삭제함 — 수치는
-  이 문서와 log.md에 보존.
-
-**다음 순서**:
-1. `server/db/build_vector_db.py`에 overlap 지원 추가 (파일명 규칙 `kure-v1_chunk{size}_overlap{overlap}_corpus.npy`
-   대응 + `chunk_document()`에 overlap 파라미터, 테이블명 `chunks_{size}_overlap{overlap}`)
-2. chunk200_overlap50, chunk300_overlap100 둘 다 pgvector에 적재
-3. `test_val_pgvector.py`로 각각 recall/latency/용량 실측 후 최종 chunk 전략 확정 → log.md에 결정 기록
-4. Chunking 전략 최종 확정 (Phase 1 남은 체크박스) — 위 결과 반영
-5. 재사용 가능한 평가 하니스로 정리 (Phase 2 실험에 계속 쓸 것이므로) — model_test.py/jhgan.py/
-   kure_chunk.py/kure_chunk_overlap.py 모두 임시 스크립트이므로 이 시점에 통합
+**파인튜닝 관련 착안점** (아직 결정 안 됨, 다음 세션에서 다룰 것):
+1. **베이스 모델**: KURE-v1(BGE-M3 한국어 튜닝)에서 추가 파인튜닝할지, 처음부터 다른 체크포인트로
+   할지 — KURE-v1이 이미 검증된 baseline이므로 이 위에 얹는 게 자연스러움
+2. **데이터**: `train_query.json`은 `{"query": ..., "case_ids": [...]}` 형태 (val_query.json과
+   동일 포맷) — positive pair는 있으나 **hard negative는 아직 채굴 안 함**. chunks_300_overlap100
+   에서 유사도 높은데 오답인 chunk를 hard negative로 뽑는 절차 필요
+2. **어떤 단위로 학습할지**: 문서 전체 vs chunk 단위 — retrieval이 chunk 단위로 이뤄지므로
+   chunk 단위 파인튜닝이 정합성 있어 보이나, train_query의 정답 라벨은 case_id(문서) 단위라
+   chunk 단위 positive를 어떻게 정할지 결정 필요
+3. **프레임워크**: sentence-transformers의 `MultipleNegativesRankingLoss` 등이 일반적 선택지
+4. **평가**: 파인튜닝 전후를 val_query.json + chunks_300_overlap100 세팅으로 비교해야 "파인튜닝이
+   실제로 유효했는지" 정량적으로 보일 수 있음 (이 프로젝트의 핵심 가치인 "정량적 근거"와 직결)
+5. **GPU 비용**: 지금까지 encode 작업들(chunk300_overlap100만 해도 65분)을 고려하면 파인튜닝은
+   훨씬 오래 걸릴 수 있음 — 스코프를 먼저 정하고 시작하는 게 나을 것
 
 **Vector DB 관련 참고사항**:
 - FAISS 대신 **PostgreSQL+pgvector** 채택 — 이유: (1) 메타데이터 필터(법원명/사건종류명/
@@ -223,9 +207,10 @@ LLM App Engineer 프로젝트로서 합리적인 순서. 아래는 **원안 그�
   인스턴스 재시작에도 자동 기동. DB명 `lexchatbot`, 접속정보는 `server/.env`의 `DATABASE_URL`
   (이 인스턴스는 `workspace_is_volume: false`일 경우 recycle/destroy 시 Postgres 데이터
   자체는 날아감 — DB_data JSON + 캐시된 임베딩(.npy)만 있으면 재구축 가능하니 문제 없음)
-- 테이블 스키마(`server/db/schema.sql`): `chunks_200`/`chunks_500`/`chunks_1000` 각각
-  사건번호/사건명/법원명/선고일자/사건종류명(metadata) + chunk_text + embedding(VECTOR(1024))만
-  포함 — 판시사항/판결요지/판결유형/선고 등은 의도적으로 미포함(3절 논의 범위 밖)
+- 테이블 스키마(`server/db/schema.sql`): `make_chunk_table(suffix)` 함수로 필요한 chunk_size/overlap
+  조합만 그때그때 생성(`chunks_200`, `chunks_200_overlap50` 등). 공통 필드는 사건번호/사건명/
+  법원명/선고일자/사건종류명(metadata) + chunk_text + embedding(VECTOR(1024))만 포함 — 판시사항/
+  판결요지/판결유형/선고 등은 의도적으로 미포함(3절 논의 범위 밖)
 - `test_val_pgvector.py`의 `DISTINCT ON` dedupe 쿼리에 버그가 있었음(사건번호 순으로 잘려서
   사실상 무작위 후보군을 가져옴) — CTE로 "HNSW 최근접 500개를 먼저 뽑고 그 안에서만 dedupe"
   하도록 수정 완료. 이 패턴(top-k 먼저 뽑고 그 안에서 문서 단위 dedupe)은 이후 정식 retrieval

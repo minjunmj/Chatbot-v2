@@ -271,3 +271,117 @@
 - **다음**: `build_vector_db.py`에 overlap 지원 추가(파일명 규칙 + chunk_document) →
   `chunks_200_overlap50`, `chunks_300_overlap100` 두 테이블 빌드 → `test_val_pgvector.py`로
   각각 recall/latency 실측 → 최종 chunk 전략 확정.
+
+## 2026-08-19 — build_vector_db.py/test_val_pgvector.py overlap 지원, chunk200_overlap50 pgvector 실측
+
+- **스크립트 정비**: `server/db/schema.sql`을 고정 3테이블 생성 대신 `make_chunk_table(suffix)`
+  함수만 정의하도록 일반화(호출 시점에 원하는 조합만 생성). `build_vector_db.py`의
+  `chunk_document()`에 overlap 파라미터 추가(kure_chunk_overlap.py와 동일 로직), npy
+  파일명/테이블명 규칙을 `overlap=0`이면 기존과 동일(`chunks_{size}`), `overlap>0`이면
+  `chunks_{size}_overlap{overlap}`로 분기. `test_val_pgvector.py`는 `--chunk-size` 대신
+  `--table`로 임의 테이블명을 받도록 변경. 빌드 전 chunk_document 재생성 결과가 캐시된 npy의
+  row 수와 정확히 일치하는지 사전 검증 완료(chunk200_overlap50: 1,090,921 일치, chunk300_overlap100:
+  823,763 일치).
+- **디스크 정리**: 기존 `chunks_200`, `chunks_500`(빈 테이블) 삭제 — overlap 두 후보를
+  비교하기 위한 자리 확보. 결론에서 밀린 `kure-v1_chunk300_overlap0_corpus.npy`(1.06GB), 더는
+  안 쓰는 `kure-v1_corpus.npy`(no-chunk baseline, 88M)도 삭제.
+- **chunk200_overlap50 pgvector 빌드+검증**: 1,090,921행 적재(716.3초), HNSW 인덱스 빌드
+  5395.6초(≈90분), 테이블+인덱스 총 용량 **15GB** (사전 추정 14.6GB와 근접). val_query.json
+  7,280개로 검증:
+
+| | recall@1 | recall@5 | recall@10 | recall@20 | mrr@10 | latency mean | latency p99 |
+|---|---|---|---|---|---|---|---|
+| chunk200 (overlap 없음, pgvector) | 0.5433 | 0.7905 | 0.8577 | 0.9021 | 0.6487 | 7.73ms | 12.63ms |
+| **chunk200_overlap50 (pgvector)** | **0.5758** | 0.8202 | 0.8784 | 0.9228 | **0.6798** | 7.25ms | 11.50ms |
+| (참고) chunk200_overlap50 exact | 0.5848 | 0.8321 | 0.8912 | 0.9372 | 0.6899 | - | - |
+
+  - exact search 대비 pgvector 손실폭 약 0.9~1.4%p — 지금까지 패턴과 일치, 정상.
+  - **기존 chunk200(overlap 없음) 대비 실제 DB 환경에서도 확실히 우세**: recall@1 +3.25%p,
+    mrr@10 +3.11%p. **latency는 오히려 근소하게 더 빠름**(오차 범위 내로 보이나 최소한 손해는
+    없음) — overlap을 추가해도 검색 속도에 불리하지 않음을 실측으로 재확인.
+  - 트레이드오프는 순수하게 **DB 용량(+36%, 11GB→15GB)** 뿐.
+- **디스크 위기**: 테이블 빌드 후 여유 공간이 1.7GB(95% 사용)까지 떨어짐 — chunk300_overlap100
+  (예상 11GB)을 이어서 만들 공간이 없음. `chunks_200_overlap50` 테이블은 위 결과를 문서에
+  기록한 뒤 삭제 예정(수치는 보존되므로 원본 없이도 최종 판단 가능, 필요하면 npy 캐시
+  `kure-v1_chunk200_overlap50_corpus.npy`로 재인코딩 없이 재구축 가능).
+- **다음**: `chunks_200_overlap50` 삭제 → 여유 공간 확보 → `chunks_300_overlap100` 빌드+검증 →
+  두 후보(둘 다 chunk200 overlap-없음보다 우세, exact search 기준 사실상 동률) 중 최종 선택.
+
+## 2026-08-20 — chunk300_overlap100 최종 확정 (chunking 전략 확정)
+
+- **chunks_300_overlap100 pgvector 빌드+검증**: 823,763행 적재(547.4초), HNSW 인덱스 빌드
+  3934.7초(≈66분), 테이블+인덱스 용량 **11GB**(사전 추정과 일치, chunk200과 row 수가 같아서
+  용량도 거의 동일).
+- **1차 latency 측정에서 이상치 발견**: 빌드 직후 바로 테스트했더니 mean 12.34ms/p99 31.07ms로
+  chunk200_overlap50(7.25ms/11.50ms)보다 눈에 띄게 느리게 나옴 — row 수가 더 적은데(82만 vs
+  109만) 더 느린 게 이상해서 재검증함.
+- **재검증 결과 — 첫 측정은 cold cache 노이즈였음**: 같은 테이블로 바로 다시 측정하니
+  mean 6.87ms/p99 ~10ms로 나옴(recall/mrr은 결정적 계산이라 두 번 다 동일). 빌드 직후
+  캐시가 안 데워진 상태에서 첫 측정을 한 게 원인으로 추정 — latency 측정은 웜업 후 값을
+  신뢰해야 한다는 교훈.
+- **최종 비교** (chunk200_overlap50 vs chunk300_overlap100, 둘 다 pgvector 실측):
+
+| | chunk200_overlap50 | chunk300_overlap100 |
+|---|---|---|
+| recall@1 | 0.5758 | 0.5714 (-0.44%p) |
+| recall@5 | 0.8202 | 0.8085 (-1.17%p) |
+| recall@10 | 0.8784 | 0.8703 (-0.81%p) |
+| recall@20 | 0.9228 | 0.9133 (-0.95%p) |
+| mrr@10 | 0.6798 | 0.6720 (-0.78%p) |
+| latency mean | 7.25ms | 6.87ms (오히려 근소 우위) |
+| latency p99 | 11.50ms | ~10ms (오히려 근소 우위) |
+| DB 용량 | 15 GB | **11 GB (-27%)** |
+
+  - latency는 사실상 무승부(chunk300_overlap100이 오히려 근소하게 빠름), 정확도는
+    chunk200_overlap50이 소폭 우세(1%p 안팎, recall@1은 0.44%p로 거의 오차 수준), 용량은
+    chunk300_overlap100이 27% 더 작음.
+- **최종 결정: chunk300_overlap100 채택.** 근거 — 정확도 격차가 작아서(특히 recall@1은
+  거의 무의미한 차이) 용량 27% 절감의 실익이 더 크다고 판단. Chunking 전략 확정:
+  **chunk_size=300, overlap=100(글자 단위), KURE-v1 임베딩.**
+- **정리**: `chunks_300_overlap100`을 정식 서빙용 테이블로 유지. `chunks_200_overlap50`은
+  이미 삭제됨(수치는 위 표에 보존). 남은 npy 캐시 중 `kure-v1_chunk200_overlap50_corpus.npy`
+  (2.08GB, 탈락 후보)는 정리 대상, `kure-v1_chunk300_overlap100_corpus.npy`(1.57GB, 채택된
+  후보)는 재구축 대비 보존.
+- **다음**: Phase 1(Chunking/Metadata 설계) 공식 종료. Phase 2로 — 사용자가 임베딩 모델
+  도메인 파인튜닝(train_query.json 기반 contrastive fine-tuning) 착수 예정.
+
+## 2026-08-20 — 임베딩 파인튜닝 설계 논의 (in-batch negative 버전 착수)
+
+Phase 2 첫 작업으로 KURE-v1 도메인 파인튜닝 설계를 논의하고 1단계(in-batch negative만) 코드
+작성. 논의된 결정사항:
+
+- **학습 단위: chunk 단위** (문서 단위 아님) — 실제 retrieval이 chunk 단위(`chunks_300_overlap100`)
+  로 이뤄지므로 정합성을 위해 chunk 단위로 학습하기로 함.
+- **positive chunk 선택 방법**: `train_query.json`은 문서(case_id) 단위 정답만 있고 chunk
+  단위 정답은 원본 데이터 자체에 없음 — 어차피 근사치(proxy label)를 쓸 수밖에 없는 상황.
+  세 가지 대안(① 현재 KURE-v1로 정답 문서 내에서 최고 유사도 chunk 선택, ② 정답 문서의 모든
+  chunk를 positive로 사용, ③ 학습 중 매 스텝 동적 재선택(MIL))을 검토. ①은 "모델 자신의
+  판단으로 그 모델을 학습"시키는 순환 논리 우려가 제기됐으나, "82만 개 전체에서 정답 찾기"
+  (어려운 문제, 지금 recall@1 0.57)와 "이미 정답이라고 알고 있는 문서 1개의 chunk 10~30개
+  중에서 고르기"(훨씬 쉬운 하위 문제)는 난이도가 다르다는 근거로 순환 위험이 실질적으로는
+  낮다고 판단. 판결문 특성상 당사자 표시·주문 등 무관한 chunk가 많아 ②(전부 positive)는
+  노이즈가 클 것으로 예상돼 채택 안 함. **① 채택**, 다만 완벽한 정답이 아닌 근사치임을 명시.
+- **loss / 학습 방식**: `MultipleNegativesRankingLoss`(InfoNCE 계열, sentence-transformers) —
+  BGE-M3/KURE-v1 원래 학습 방식과 같은 계열이라 이어서 학습하기 자연스러움. 1단계는
+  in-batch negative만 사용, hard negative는 2단계(추후 결정)에서 추가해 성능 개선분을 ablation
+  형태로 비교할 계획.
+- **batch size 중요성**: in-batch negative 방식은 배치 크기가 곧 negative 개수(batch_size-1)로
+  직결돼서, 대조학습 일반적으로 batch가 클수록 학습 신호가 좋아짐 — 이 인스턴스(RTX 3090
+  24GB) VRAM이 허용하는 한 크게 잡는 게 유리. gradient accumulation은 유효 batch는 키워도
+  negative pool 크기(물리적 batch당 계산되는 것)는 안 늘려준다는 점 확인.
+- **false negative 위험 확인**: train_query.json이 문서 단위로 순회하며 만들어진 파일이라
+  **셔플 안 하면 인접한 두 쿼리가 같은 case_id를 가리키는 비율이 8.15%**(3,368/41,318)로
+  실측됨 — 배치를 순서대로 자르면 같은 배치에 같은 문서 관련 쿼리가 뭉쳐 들어가 false
+  negative가 심각해질 수 있음. **매 epoch 셔플**(표준 관행, HuggingFace Trainer 기본 동작)
+  로 해결 — 셔플 후 잔여 충돌 확률은 대략 0.2~0.3% 수준으로 계산돼 허용 가능한 노이즈로 판단.
+- **구현**: `server/finetune/` 신설.
+  - `prepare_data.py` — train_query.json 순회하며 각 쿼리의 정답 문서 chunk들을
+    `chunks_300_overlap100`에서 조회, 현재 KURE-v1로 유사도 계산해 최고 chunk를 positive로
+    선택 → `finetune_pairs.jsonl` 생성
+  - `train.py` — sentence-transformers `SentenceTransformerTrainer` + `MultipleNegativesRankingLoss`
+    로 1단계(in-batch negative) 파인튜닝
+  - `eval_model.py` — 임의 모델 경로(base KURE-v1 또는 파인튜닝 결과)를 받아 val_query.json
+    기준 recall@k/mrr@10 계산 (kure_chunk_overlap.py와 동일한 exact-search 방법론) — 파인튜닝
+    전후 비교용
+- **다음**: 사용자가 `prepare_data.py` → `train.py` 실행 → `eval_model.py`로 base vs
+  파인튜닝 비교. 이후 hard negative 채굴 방식 결정해서 2단계 진행.
