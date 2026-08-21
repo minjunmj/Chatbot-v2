@@ -499,3 +499,30 @@ Phase 2 첫 작업으로 KURE-v1 도메인 파인튜닝 설계를 논의하고 1
 - **정리 실행**: `model_test.py`, `jhgan.py`, `kure_chunk.py`, `kure_chunk_overlap.py` 삭제.
   `bge_hybrid.py`(sparse 로직 미포팅이라 참고용 보존), `test_val_pgvector.py`,
   `finetune/eval_model.py`는 남겨둠(추후 판단).
+- **git**: 위 정리 + eval 하니스 신설 내용을 `.gitignore`에 `server/finetune/output/`,
+  `server/finetune/*.jsonl` 추가(파인튜닝 모델 2.2GB가 GitHub 파일 크기 제한(100MB) 초과라
+  누락 시 push 실패했을 것)한 뒤 커밋(`882f8f5`) + push 완료.
+
+## 2026-08-21 — Phase B(hard negative, skip_top 수정판) 재실행 결과 — 최종 임베딩 모델 확정
+
+- **결과 — Phase A를 확실히 상회, 가설 검증됨**:
+
+| | base(exact) | Phase A(in-batch) | Phase B 1차(버그) | **Phase B 2차(skip_top=5)** |
+|---|---|---|---|---|
+| recall@1 | 0.5826 | 0.6574 | 0.6231 | **0.6826** |
+| recall@5 | 0.8236 | 0.8776 | 0.8489 | **0.9040** |
+| recall@10 | 0.8861 | 0.9262 | 0.9033 | **0.9446** |
+| recall@20 | 0.9304 | 0.9622 | 0.9401 | **0.9698** |
+| mrr@10 | 0.6849 | 0.7519 | 0.7205 | **0.7766** |
+
+  - Phase A 대비 recall@1 +2.52%p, mrr@10 +2.47%p — "유사도 최상위 negative가 false
+    negative일 가능성이 크다"는 어제 가설이 실측으로 확인됨.
+  - **base 대비 전체 파이프라인 개선폭(최종 성과): recall@1 +10.0%p(상대 +17.2%),
+    mrr@10 +9.17%p** — chunking 전략 확정(chunk300_overlap100) + Phase A(in-batch) +
+    Phase B(hard negative, skip_top=5) 전체를 합친 순수 개선.
+- **결정: 이 모델(`server/finetune/output/kure-v1-finetuned-hard/`)을 최종 임베딩 모델로 확정.**
+  1차 시도 실패 → 원인 분석(false negative 가설) → 수정(`--skip-top`) → 검증까지의 전체
+  과정이 기록으로 남아있어 근거가 명확함.
+- **다음**: 임베딩 모델 파인튜닝(Phase 2 핵심 항목) 완료. 이후 후보: sparse+dense hybrid
+  score 결합, reranker(기성 또는 파인튜닝), MMR 다양성 재정렬, 메타데이터 필터 결합,
+  query rewriting은 이번 스코프 제외(2026-08-20 논의) — 우선순위는 PROJECT_STATE.md 참고.
