@@ -11,6 +11,12 @@ kure_chunk_overlap.py/test_val_pgvector.py/finetune/eval_model.py가 하던 걸 
     # pgvector (실제 서빙 latency까지 포함) — 정식 DB 테이블 대상
     python run_eval.py --mode pgvector --model-path nlpai-lab/KURE-v1 --table chunks_300_overlap100 --measure-latency
 
+    # sparse (Kiwi+tsvector, dense 모델 불필요)
+    python run_eval.py --mode sparse --table chunks_300_overlap100
+
+    # hybrid (dense+sparse, RRF 결합) — --model-path 필요(dense용)
+    python run_eval.py --mode hybrid --model-path ../finetune/output/kure-v1-finetuned-hard --table chunks_300_overlap100
+
     # 빠른 확인용 쿼리 수 제한
     python run_eval.py --mode exact --model-path nlpai-lab/KURE-v1 --chunk-size 300 --overlap 100 --limit 500
 """
@@ -27,7 +33,7 @@ import torch
 from sentence_transformers import SentenceTransformer
 
 from harness import evaluate
-from retrievers import DenseExactRetriever, PgvectorRetriever
+from retrievers import DenseExactRetriever, PgvectorRetriever, SparseRetriever, HybridRetriever
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # server/
 DB_DIR = os.path.join(BASE_DIR, "..", "data", "DB_data")
@@ -116,21 +122,29 @@ def encode_corpus_cached(model, chunk_texts, cache_path, batch_size=32):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", required=True, choices=["exact", "pgvector"])
-    parser.add_argument("--model-path", required=True)
+    parser.add_argument("--mode", required=True, choices=["exact", "pgvector", "sparse", "hybrid"])
+    parser.add_argument("--model-path", help="exact/pgvector/hybrid 필수 (sparse는 불필요, dense 모델 안 씀)")
     parser.add_argument("--chunk-size", type=int, help="--mode exact 필수")
     parser.add_argument("--overlap", type=int, default=0, help="--mode exact 전용, 기본 0")
-    parser.add_argument("--table", help="--mode pgvector 필수 (예: chunks_300_overlap100)")
+    parser.add_argument("--table", help="--mode pgvector/sparse/hybrid 필수 (예: chunks_300_overlap100)")
     parser.add_argument("--limit", type=int, default=None, help="빠른 확인용 쿼리 수 제한")
     parser.add_argument("--measure-latency", action="store_true")
+    parser.add_argument("--dense-weight", type=float, default=1.0, help="--mode hybrid 전용, RRF 가중치")
+    parser.add_argument("--sparse-weight", type=float, default=1.0,
+                         help="--mode hybrid 전용, RRF 가중치 — sparse가 dense보다 훨씬 약하면 낮게 잡을 것 "
+                              "(2026-08-24: 1.0/1.0 동일 가중치는 dense 단독보다 크게 나빴음)")
     args = parser.parse_args()
 
     val_data = load_val(args.limit)
     print(f"평가 쿼리 수: {len(val_data)}")
 
-    print(f"모델 로딩: {args.model_path}")
-    model = SentenceTransformer(args.model_path, device=DEVICE,
-                                 model_kwargs={"torch_dtype": torch.float16} if DEVICE == "cuda" else None)
+    model = None
+    if args.mode in ("exact", "pgvector", "hybrid"):
+        if not args.model_path:
+            raise ValueError(f"--mode {args.mode}는 --model-path 필수")
+        print(f"모델 로딩: {args.model_path}")
+        model = SentenceTransformer(args.model_path, device=DEVICE,
+                                     model_kwargs={"torch_dtype": torch.float16} if DEVICE == "cuda" else None)
 
     if args.mode == "exact":
         if not args.chunk_size:
@@ -143,12 +157,29 @@ def main():
         cache_path = cache_path_for(args.model_path, args.chunk_size, args.overlap)
         doc_embs = encode_corpus_cached(model, chunk_texts, cache_path)
         retriever = DenseExactRetriever(model, chunk_case_ids, doc_embs=doc_embs, device=DEVICE)
-    else:
+
+    elif args.mode == "pgvector":
         if not args.table:
             raise ValueError("--mode pgvector는 --table 필수")
         import psycopg2
         conn = psycopg2.connect(DATABASE_URL)
         retriever = PgvectorRetriever(model, conn, args.table)
+
+    elif args.mode == "sparse":
+        if not args.table:
+            raise ValueError("--mode sparse는 --table 필수")
+        import psycopg2
+        conn = psycopg2.connect(DATABASE_URL)
+        retriever = SparseRetriever(conn, args.table)
+
+    else:  # hybrid
+        if not args.table:
+            raise ValueError("--mode hybrid는 --table 필수")
+        import psycopg2
+        conn = psycopg2.connect(DATABASE_URL)
+        dense = PgvectorRetriever(model, conn, args.table)
+        sparse = SparseRetriever(conn, args.table)
+        retriever = HybridRetriever(dense, sparse, dense_weight=args.dense_weight, sparse_weight=args.sparse_weight)
 
     result = evaluate(retriever, val_data, measure_latency=args.measure_latency)
     print("\n===== 결과 =====")

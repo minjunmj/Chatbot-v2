@@ -7,6 +7,9 @@ harness.py의 evaluate()에 꽂아 쓰는 Retriever 구현체들. 새 검색 방
 순위 리스트"여야 함 — 여러 chunk가 같은 문서에서 나와도 그 문서는 한 번만, 제일 점수 높은
 순서로.
 """
+import math
+from collections import Counter
+
 import numpy as np
 import torch
 
@@ -100,4 +103,161 @@ class PgvectorRetriever:
                 )
                 rows = sorted(cur.fetchall(), key=lambda r: r[1])[:max_k]
                 results.append([r[0] for r in rows])
+        return results
+
+
+# server/db/build_vector_db.py의 KIWI_KEEP_PREFIXES와 반드시 동일해야 함 — 문서 쪽(DB 적재
+# 시)과 검색어 쪽(여기)의 토큰화 방식이 다르면 tsvector 매칭 자체가 안 됨(2026-08-21 실측
+# 확인: "손해배상"을 Kiwi 없이 그대로 검색하면 "손해"+"배상"으로 쪼개 저장된 문서와 매칭 실패).
+KIWI_KEEP_PREFIXES = ("NN", "NP", "NR", "VV", "VA", "VX", "MAG", "MAJ", "SL", "SH", "SN", "XR")
+
+
+class SparseRetriever:
+    """Postgres 내장 전문검색(tsvector/GIN) + Kiwi 형태소 분석으로 후보를 빠르게 추리고,
+    그 후보들만 진짜 BM25 공식(IDF + tf 포화 + 문서길이 보정)으로 재점수/재정렬하는 sparse 검색.
+    build_vector_db.py가 content_tsv/chunk_text_kiwi 컬럼을 채워둔 테이블이 필요함.
+
+    Postgres의 ts_rank_cd는 진짜 BM25가 아님(IDF/k1/b 없이 단순 위치·빈도 가중치라 학습도
+    튜닝도 안 됨) — 그래서 1단계(SQL, GIN)로는 후보만 빠르게 뽑고, 2단계(Python)에서
+    표준 Okapi BM25로 다시 점수를 매김:
+        score(q,d) = sum_t IDF(t) * tf(t,d)*(k1+1) / (tf(t,d) + k1*(1-b+b*|d|/avgdl))
+    IDF/avgdl은 ts_stat()으로 코퍼스 전체를 한 번 스캔해 __init__에서 미리 계산해둠(쿼리마다
+    다시 계산 안 함).
+
+    너무 흔한 단어(예: "회사"/"경우"/"이유" 등 법률 문서 어디에나 있는 단어)가 1단계 OR
+    검색어에 섞이면 매칭이 전체의 절반 이상으로 폭발해서 GIN 인덱스를 안 쓰고 순차 스캔(seq
+    scan)으로 떨어짐 — 쿼리 1개에 5초씩 걸리는 문제로 실측 확인(2026-08-24). 그래서 문서빈도
+    (ndoc) 상위 top_common_pct%(기본 3%)를 "너무 흔한 단어"로 걸러내고 1단계 후보 검색에서만
+    제외(실제 BM25 점수 계산에는 여전히 전체 코퍼스 기준 IDF를 그대로 사용 — 흔한 단어는
+    IDF가 낮아서 어차피 점수에 거의 기여 안 하므로 걸러내도 랭킹 품질 손실 없음)."""
+
+    def __init__(self, conn, table, pool_k=500, top_common_pct=0.03, k1=1.5, b=0.75):
+        from kiwipiepy import Kiwi
+        self.conn = conn
+        self.table = table
+        self.pool_k = pool_k
+        self.k1 = k1
+        self.b = b
+        self.kiwi = Kiwi(num_workers=-1)
+        self.common_words, self.idf, self.avgdl = self._load_corpus_stats(top_common_pct)
+
+    def _load_corpus_stats(self, top_common_pct):
+        with self.conn.cursor() as cur:
+            cur.execute(f"SELECT count(*) FROM {self.table}")
+            n_docs = cur.fetchone()[0]
+            # ts_stat: 코퍼스 전체를 스캔해 단어별 ndoc(등장 문서 수)/nentry(총 등장 횟수)를
+            # 한 번에 계산 — 여기서 나온 값으로 IDF와 평균 문서 길이(avgdl)를 미리 구해둠.
+            cur.execute(f"SELECT word, ndoc, nentry FROM ts_stat('SELECT content_tsv FROM {self.table}')")
+            rows = cur.fetchall()
+
+        common_words = {w for w, ndoc, _ in rows if ndoc > n_docs * top_common_pct}
+        # Okapi BM25 IDF: 흔한 단어(ndoc 큼)일수록 0에 가까워지고, 드문 단어일수록 커짐.
+        idf = {w: math.log((n_docs - ndoc + 0.5) / (ndoc + 0.5) + 1) for w, ndoc, _ in rows}
+        avgdl = sum(nentry for _, _, nentry in rows) / n_docs if n_docs else 0.0
+        return common_words, idf, avgdl
+
+    def _tokenize(self, texts):
+        results = []
+        for tokens in self.kiwi.tokenize(texts):
+            kept = [t.form for t in tokens if t.tag.startswith(KIWI_KEEP_PREFIXES)]
+            results.append(" ".join(kept))
+        return results
+
+    def _bm25_score(self, query_terms, doc_text):
+        doc_terms = doc_text.split() if doc_text else []
+        doc_len = len(doc_terms)
+        if doc_len == 0 or self.avgdl == 0:
+            return 0.0
+        tf_counter = Counter(doc_terms)
+        score = 0.0
+        for t in query_terms:
+            tf = tf_counter.get(t, 0)
+            if tf == 0:  # 이 chunk에 아예 안 나오는 단어는 기여 0(IDF 몰라도 상관없음)
+                continue
+            idf = self.idf.get(t, 0.0)
+            denom = tf + self.k1 * (1 - self.b + self.b * doc_len / self.avgdl)
+            score += idf * tf * (self.k1 + 1) / denom
+        return score
+
+    def retrieve_batch(self, queries, max_k):
+        queries_kiwi = self._tokenize(queries)
+
+        results = []
+        with self.conn.cursor() as cur:
+            for q in queries_kiwi:
+                terms = q.split()
+                if not terms:  # 형태소 분석 결과 실질형태소가 하나도 안 남은 경우(드묾)
+                    results.append([])
+                    continue
+                # 너무 흔한 단어(__init__ 주석 참고)는 1단계 후보 검색에서만 제외 — 다
+                # 걸러졌으면(드묾, 짧은 질문 등) 어쩔 수 없이 원래 단어 그대로 사용
+                filtered = [t for t in terms if t not in self.common_words]
+                query_terms = filtered if filtered else terms
+                # 1단계(SQL/GIN): plainto_tsquery는 전부 AND라 40~50개 키워드가 있는 val
+                # 질문에는 안 맞음(2026-08-24 실측, 매칭 0건) — OR(|)로 후보 pool_k개를 빠르게
+                # 확보만 하고, 최종 순위는 아래 2단계 진짜 BM25로 다시 매김.
+                or_query = " | ".join(query_terms)
+                cur.execute(
+                    f"WITH matched AS ("
+                    f"    SELECT case_no, chunk_text_kiwi, ts_rank_cd(content_tsv, query) AS rank "
+                    f"    FROM {self.table}, to_tsquery('simple', %s) query "
+                    f"    WHERE content_tsv @@ query "
+                    f"    ORDER BY rank DESC LIMIT {self.pool_k}"
+                    f") "
+                    f"SELECT case_no, chunk_text_kiwi FROM matched",
+                    (or_query,),
+                )
+                candidates = cur.fetchall()
+
+                # 2단계(Python): 후보들만 대상으로 진짜 BM25 재점수. 점수 내림차순으로 정렬한
+                # 뒤 case_no 중복 제거하면 각 문서의 "가장 점수 높은 chunk"가 자동으로 남음.
+                scored = [(case_no, self._bm25_score(query_terms, text)) for case_no, text in candidates]
+                scored.sort(key=lambda r: r[1], reverse=True)
+
+                seen = set()
+                ranked = []
+                for case_no, _ in scored:
+                    if case_no not in seen:
+                        seen.add(case_no)
+                        ranked.append(case_no)
+                        if len(ranked) >= max_k:
+                            break
+                results.append(ranked)
+        return results
+
+
+class HybridRetriever:
+    """dense(예: PgvectorRetriever)와 sparse(SparseRetriever)를 가중 RRF(Reciprocal Rank
+    Fusion)로 결합. 원래 점수의 스케일이 서로 다른(코사인 거리 vs ts_rank) 두 결과를,
+    "몇 위인지"라는 공통 기준으로 바꿔서 합침 — bge_hybrid.py(2026-08-18)와 같은 방식에
+    가중치(dense_weight/sparse_weight)를 추가.
+
+    동일 가중치(1.0/1.0)로 처음 돌려봤더니 dense 단독보다 오히려 크게 나빠짐(2026-08-24,
+    recall@1 0.6826→0.4727) — sparse 단독 성능이 dense보다 훨씬 약한데(recall@1 0.203)
+    RRF가 "sparse가 1위로 꼽았다"는 사실만으로 오답에도 점수를 얹어줘서, dense가 정확히
+    맞춘 결과를 오히려 밀어내는 문제였음. sparse가 dense보다 확연히 약할 때는 sparse
+    기여도를 낮게 잡아야 함 — 두 retriever 실력이 비슷할 때 잘 맞는 RRF의 알려진 한계."""
+
+    def __init__(self, dense_retriever, sparse_retriever, k=60, pool_k=100,
+                 dense_weight=1.0, sparse_weight=1.0):
+        self.dense = dense_retriever
+        self.sparse = sparse_retriever
+        self.k = k
+        self.pool_k = pool_k
+        self.dense_weight = dense_weight
+        self.sparse_weight = sparse_weight
+
+    def retrieve_batch(self, queries, max_k):
+        dense_results = self.dense.retrieve_batch(queries, self.pool_k)
+        sparse_results = self.sparse.retrieve_batch(queries, self.pool_k)
+
+        results = []
+        for dense_ranked, sparse_ranked in zip(dense_results, sparse_results):
+            scores = {}
+            for rank, cid in enumerate(dense_ranked, start=1):
+                scores[cid] = scores.get(cid, 0.0) + self.dense_weight / (self.k + rank)
+            for rank, cid in enumerate(sparse_ranked, start=1):
+                scores[cid] = scores.get(cid, 0.0) + self.sparse_weight / (self.k + rank)
+            ranked = sorted(scores, key=scores.get, reverse=True)[:max_k]
+            results.append(ranked)
         return results

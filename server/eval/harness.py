@@ -12,6 +12,7 @@ recall@k/mrr@10 계산 → 출력"이라는 같은 로직을 매번 새로 짰�
 import time
 
 import numpy as np
+from tqdm import tqdm
 
 
 def evaluate(retriever, val_data, k_list=(1, 5, 10, 20), mrr_k=10, batch_size=64, measure_latency=False):
@@ -26,7 +27,8 @@ def evaluate(retriever, val_data, k_list=(1, 5, 10, 20), mrr_k=10, batch_size=64
     n = len(val_data)
     latencies_ms = []
 
-    for start in range(0, n, batch_size):
+    n_batches = (n + batch_size - 1) // batch_size
+    for start in tqdm(range(0, n, batch_size), total=n_batches, desc="evaluate", ncols=80):
         batch = val_data[start:start + batch_size]
         queries = [item["query"] for item in batch]
 

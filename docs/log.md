@@ -526,3 +526,142 @@ Phase 2 첫 작업으로 KURE-v1 도메인 파인튜닝 설계를 논의하고 1
 - **다음**: 임베딩 모델 파인튜닝(Phase 2 핵심 항목) 완료. 이후 후보: sparse+dense hybrid
   score 결합, reranker(기성 또는 파인튜닝), MMR 다양성 재정렬, 메타데이터 필터 결합,
   query rewriting은 이번 스코프 제외(2026-08-20 논의) — 우선순위는 PROJECT_STATE.md 참고.
+- **디스크 정리**: Phase A 모델(2.2GB)+그 코퍼스 캐시(1.6GB)+중간 학습 데이터(finetune_pairs*.jsonl,
+  111MB) 삭제 — Phase B가 최종이라 재현 불필요. 929MB(98%)까지 위험했던 여유를 4.8GB로 확보.
+- **중요 발견**: `chunks_300_overlap100` 운영 DB는 아직 **base KURE-v1 임베딩**으로 구축돼있음
+  (파인튜닝 전에 만들어짐) — Phase B 검증(recall@1 0.6826)은 별도 exact-search 방식으로 한
+  것이지 DB 자체를 바꾼 게 아님. DB를 파인튜닝 임베딩으로 재구축해야 실제 검색에 반영됨.
+
+## 2026-08-21 — sparse(BM25) 검색 설계: Postgres 내장 tsvector + Kiwi 채택, DB 재구축 준비
+
+- **sparse 방식 재검토**: BGE-M3 learned sparse를 먼저 검토했으나, 이 인스턴스 pgvector가
+  0.6.0(apt 최신 버전)이라 sparse 벡터 타입(`sparsevec`)이 필요한 0.7.0 미달 — 같은 테이블에
+  못 넣고 별도 저장소가 필요해짐. 게다가 BGE-M3 모델을 KURE-v1(파인튜닝)과 별도로 GPU에
+  상시 로드해야 하는 부담도 있음. **Postgres 내장 전문검색(tsvector/GIN) + Kiwi 형태소
+  분석기**로 결정 — 같은 테이블에 컬럼만 추가하면 되고 별도 모델 상시 로드도 불필요. 다만
+  Postgres 기본 `ts_rank`는 정식 BM25 공식과 동일하지 않음(개념적으로 유사한 역색인+빈도
+  기반 랭킹, 파라미터화된 BM25는 아님) — 필요해지면 `pg_search`(ParadeDB) 등 확장 검토 가능.
+- **Kiwi 처리 속도 실측**: `num_workers=-1`(전체 코어) 배치 처리 기준 823,763개 chunk 전체
+  약 7분(1,930개/초) — GPU 불필요, 오래 안 걸림.
+- **형태소 필터링**: 조사(J*)/어미(E*)/접미사(XS*)/문장부호 제외, 명사(NN*)/동사(VV,VA,VX)/
+  부사(MAG,MAJ)/숫자·한자·외국어(SN,SH,SL)/어근(XR)만 남겨서 검색 노이즈 감소.
+- **⚠️ 중요 버그 발견+확인**: Kiwi가 복합명사를 쪼갬(예: "손해배상"→"손해"+"배상" 별도 토큰).
+  그래서 **검색어를 Kiwi 없이 원문 그대로 `to_tsquery`에 넣으면 매칭 실패**함(저장은
+  "손해"+"배상" 두 토큰인데 검색은 "손해배상" 한 토큰이라 문자열이 다름). 테스트로 재현
+  확인 후, **검색 시에도 사용자 질문을 반드시 Kiwi로 먼저 처리한 뒤 `plainto_tsquery`에
+  넣어야 함**을 확인 — 나중에 SparseRetriever 구현 시 필수 반영 사항.
+- **`build_vector_db.py` 확장**:
+  - `chunk_text_kiwi TEXT`(Kiwi 토큰, 공백 조인) + `content_tsv tsvector`(GIN 인덱스) 컬럼을
+    `schema.sql`의 `make_chunk_table`에 추가
+  - `--npy-path` 옵션 추가 — 임의의 임베딩 캐시를 지정 가능해짐 (기존엔 `kure-v1_chunk...`
+    고정 파일명만 지원해서 파인튜닝 모델 임베딩을 못 썼음)
+  - COPY 적재 후 `UPDATE ... SET content_tsv = to_tsvector('simple', chunk_text_kiwi)` 한
+    번에 처리, 이어서 GIN 인덱스 생성
+  - 가짜 테이블로 COPY+UPDATE+GIN 검색까지 전체 파이프라인 검증 완료(위 버그도 이 과정에서
+    발견)
+- **다음**: `chunks_300_overlap100`을 파인튜닝 모델(`kure-v1-finetuned-hard`) 임베딩+
+  Kiwi/tsvector 컬럼까지 포함해서 재구축 — `--npy-path`로 기존 eval 캐시
+  (`eval_._output_kure-v1-finetuned-hard_chunk300_overlap100_corpus.npy`, 재인코딩 불필요)
+  재사용.
+
+## 2026-08-24 — DB 재구축 중 심각한 성능 버그 발견+수정: 기존 인덱스가 COPY를 극도로 느리게 만듦
+
+- **증상**: 재구축 실행 중 "적재" 단계가 50,000행(COPY_BATCH 1개분) 이후 급격히 느려짐 —
+  두 번째 50,000행 COPY에 11분 넘게 걸림(이 속도면 823,763행 전체에 3시간 이상 예상).
+- **원인**: `chunks_300_overlap100`은 **이전 빌드(base 모델용)에서 이미 HNSW 인덱스가 붙어있는
+  기존 테이블**이었음. `TRUNCATE`는 데이터만 비우고 인덱스는 그대로 두는데, 인덱스가 붙어있는
+  상태로 COPY하면 Postgres가 **row 하나 넣을 때마다 HNSW 그래프를 실시간으로 갱신**해야 해서
+  극도로 느려짐. 원래 빠른 이유(대량 데이터 먼저 넣고 인덱스는 나중에 한 번에 빌드)가
+  깨진 것 — 완전히 새로운 테이블(`chunks_200` 등)을 만들 때는 안 나타나고, **기존 테이블을
+  재사용/재구축할 때만** 나타나는 버그라 이번에 처음 발견됨.
+- **수정**: `build_vector_db.py`의 `TRUNCATE` 직전에 `DROP INDEX IF EXISTS`로 기존 인덱스
+  (HNSW, case_no, case_type, content_tsv GIN)를 전부 먼저 제거하도록 추가. 이후 코드는 원래
+  대로 데이터 적재 완료 후 인덱스를 한 번에 재생성.
+- **교훈**: 같은 테이블 이름으로 재구축(rebuild-in-place)하는 스크립트는 "완전히 빈 테이블"을
+  가정하면 안 되고, 기존 인덱스/제약조건이 있을 수 있다는 걸 감안해서 짜야 함.
+- **다음**: 수정된 스크립트로 재실행.
+- **재실행 완료 — DB 재구축 성공**: 823,763행 적재(541.8초), content_tsv 채우기(67.6초),
+  인덱스 빌드(HNSW+case_no+case_type+GIN, 4250.7초≈70.8분), 테이블+인덱스 총 용량 13GB.
+  인덱스 목록/`content_tsv` 전체 행 채움/Kiwi 토큰 샘플까지 확인 완료.
+  **`chunks_300_overlap100`이 이제 (1) 파인튜닝 모델(kure-v1-finetuned-hard) dense 임베딩,
+  (2) Kiwi+tsvector 기반 sparse(BM25) 검색 컬럼을 모두 갖춘 정식 운영 DB로 확정됨.**
+- **다음**: `server/eval/retrievers.py`에 `SparseRetriever`(Kiwi 토큰화 + `plainto_tsquery`
+  검색) 구현 → dense(PgvectorRetriever)와 RRF로 결합하는 `HybridRetriever` → `run_eval.py`로
+  성능 실측·비교.
+
+## 2026-08-24 — SparseRetriever/HybridRetriever 구현, ⚠️ AND매칭 버그 발견+수정
+
+- **`SparseRetriever` 구현**: `server/eval/retrievers.py`에 추가 — 검색어를 Kiwi로 토큰화
+  (`build_vector_db.py`의 `KIWI_KEEP_PREFIXES`와 동일 기준 유지 필요, 주석으로 명시)한 뒤
+  `content_tsv` 컬럼(GIN 인덱스)으로 검색.
+- **⚠️ 버그 발견+수정 — `plainto_tsquery`는 전부 AND로 묶음**: 첫 구현은 `plainto_tsquery`를
+  썼는데, 실제 val 쿼리 5개로 테스트하니 **전부 매칭 0건**이 나옴. 원인: val 질문이 길어서
+  Kiwi 토큰이 40~50개나 되는데, `plainto_tsquery`는 이 전부를 `&`(AND)로 묶어서 "이 모든
+  단어가 한 chunk(300자)에 다 들어있어야 매칭"이 됨 — 애초에 불가능한 조건. `to_tsquery`로
+  직접 `|`(OR)로 묶어 "많이 겹칠수록 `ts_rank_cd` 점수가 높다"는 정상적인 랭킹 방식으로 수정.
+  수정 후 실제 val 10개로 재검증: recall@10 6/10 (스크리닝 샘플, 정식 지표 아님).
+- **`HybridRetriever` 구현**: dense(`PgvectorRetriever`)+sparse(`SparseRetriever`)를
+  RRF(k=60, bge_hybrid.py 2026-08-18과 동일 상수)로 결합. 같은 10개 쿼리로 검증:
+  recall@10 9/10 — dense 단독/sparse 단독보다 나은 방향성 확인(정식 7,280개 평가는 아직 안 함).
+- **`run_eval.py`에 `--mode sparse`/`--mode hybrid` 추가**: sparse 모드는 dense 모델을 아예
+  안 불러오도록 분기(불필요한 GPU 로딩 방지).
+- **다음**: `run_eval.py --mode sparse`와 `--mode hybrid`로 val_query.json 7,280개 전체
+  정식 평가 → dense 단독(recall@1 0.6826) 대비 실제 개선폭 확인.
+- **⚠️ 성능 문제 발견 — sparse 쿼리가 쿼리당 ~5초로 매우 느림**: 실제 정식 평가 시작하자마자
+  발견. 원인: 법률 질문 특성상 OR로 묶는 키워드가 20~50개나 돼서, 82만 행 중 40만 행 이상이
+  매칭됨 → Postgres가 GIN 인덱스 대신 순차 스캔(seq scan)을 선택(`EXPLAIN ANALYZE`로 확인,
+  인덱스 강제 사용해봐도 동일하게 느림 — `ts_rank_cd`를 매칭된 모든 후보에 대해 계산해야
+  정렬 가능한 구조 자체가 병목).
+  - **시도 1**: 문서빈도(ndoc) 상위 3%(307개) "너무 흔한 단어"(하/있/것/사건/수/등/원고/피고
+    등 법률 문서 어디에나 있는 단어) 필터링 → 5.3초 → 0.78초로 개선(recall@10 12/20, 샘플).
+  - **시도 2~4**: 필터링 임계값을 더 세게(1%, 0.5%), 단어 개수 제한(길이 기준/실제 희귀도
+    기준 상위 N개만 사용) — 전부 추가 개선 없거나 오히려 느려지거나 정확도만 떨어짐. 원인
+    불명확, 추가 조사는 보류.
+  - **결정**: 사용자 확인 후 현재 상태(3% 필터링, 쿼리당 ~780ms)로 전체 평가 진행하기로 함
+    — 평가는 1회성 비용이라 1.5~1.7시간 소요는 감수. **단, 실제 서빙 시 사용자 응답
+    latency로 쓰기엔 여전히 느려서(dense 7~13ms 대비 100배 이상) 나중에 반드시 재검토
+    필요** (Postgres 내장 검색엔 WAND/MaxScore 같은 조기 종료 최적화가 없어서 구조적 한계일
+    수 있음 — `pg_search`(ParadeDB) 등 전용 확장 고려 대상).
+  - **다음**: 정식 7,280개 sparse/hybrid 평가 실행(사용자).
+
+## 2026-08-24 — 진짜 BM25로 SparseRetriever 재구현, hybrid RRF 격차 대폭 축소(그러나 아직 dense 못 넘음)
+
+- **원인 재확인**: 위 세션에서 균등 가중(1.0/1.0) RRF가 dense 단독보다 크게 나빴던
+  이유(recall@1 0.6826→0.4727)를 재검토하면서, `ts_rank_cd`가 IDF/tf 포화(k1)/문서길이
+  보정(b)이 없는 단순 랭킹 함수라 sparse의 절대 품질 자체가 너무 낮았다는 결론(정식 BM25가
+  아님, 학습도 불가능). 사용자가 "학습되는 sparse 모델(BGE-M3 등)"보다 **전통 BM25를 제대로
+  구현**하는 쪽을 선택.
+- **구현**: `server/eval/retrievers.py`의 `SparseRetriever`를 2단계 구조로 재작성.
+  1단계(SQL, 기존과 동일)는 `content_tsv`/GIN으로 후보 pool_k(500)개를 `ts_rank_cd` 순으로
+  빠르게 추리기만 하고, 2단계(Python, 신규)에서 후보들의 `chunk_text_kiwi`로 실제 단어
+  빈도(tf)를 세서 표준 Okapi BM25 공식(`IDF(t) = log((N-ndoc+0.5)/(ndoc+0.5)+1)`,
+  `k1=1.5`, `b=0.75`)으로 재점수·재정렬. IDF/평균 문서 길이(avgdl)는 `ts_stat()`으로
+  `__init__` 시점에 코퍼스 전체를 한 번 스캔해 미리 캐싱(쿼리마다 재계산 안 함). 흔한 단어
+  필터링(상위 3%)은 1단계 후보 검색에서만 적용하고, 실제 BM25 점수 계산에는 전체 코퍼스
+  기준 IDF를 그대로 사용(흔한 단어는 IDF가 낮아 어차피 점수 기여 미미 — 걸러도 랭킹 품질
+  손실 없음). 스키마/DB 변경 없음, 기존 컬럼 그대로 재사용.
+- **정식 평가 결과 (val_query.json 7,280개)**:
+
+  | | sparse 단독(구, ts_rank_cd) | sparse 단독(신, 진짜 BM25) | hybrid(신 BM25, 1.0/1.0) | dense 단독(최종 모델) |
+  |---|---|---|---|---|
+  | recall@1 | 0.203 | **0.5511** | 0.6309 | 0.6826 |
+  | recall@5 | (미측정) | 0.7864 | 0.8515 | 0.9040 |
+  | recall@10 | (미측정) | 0.8490 | 0.9070 | 0.9446 |
+  | recall@20 | (미측정) | 0.8891 | 0.9515 | 0.9698 |
+  | mrr@10 | (미측정) | 0.6523 | 0.7247 | 0.7766 |
+
+  - **sparse 단독 성능이 극적으로 개선**됨(recall@1 0.203→0.5511) — IDF/tf포화/문서길이
+    보정을 실제로 계산한 게 유효했음을 확인. dense 단독에는 아직 못 미치지만 격차가 크게
+    좁혀짐(0.68 vs 0.20 → 0.68 vs 0.55).
+  - **그러나 균등 가중(1.0/1.0) hybrid는 여전히 모든 지표에서 dense 단독보다 낮음**
+    (recall@1 -5.17%p, mrr@10 -5.19%p). 다만 이전(약한 sparse 기준, -21%p 수준)보다는 훨씬
+    양호 — sparse가 강해질수록 RRF의 "약한 retriever가 강한 retriever의 정답을 밀어내는"
+    문제가 줄어드는 방향성은 확인됨.
+- **`harness.py`에 tqdm 진행률 표시 추가**: `evaluate()`의 배치 루프에 진행 바가 없어서
+  sparse/hybrid처럼 쿼리당 DB 왕복이 필요해 오래 걸리는(hybrid 7,280개 기준 약 1.5시간)
+  케이스에서 진행 상황을 전혀 알 수 없었음(사용자가 "얼마나 더 걸릴지" 질문 → 코드에 진행률
+  자체가 없다는 걸 확인). `for start in tqdm(range(0, n, batch_size), total=n_batches, ...)`로
+  수정 — 다음 실행부터 배치 수 기준 ETA 표시됨.
+- **다음**: sparse가 훨씬 강해졌으니 `sparse_weight`를 낮춰가는 가중 RRF 스윕을 소규모
+  샘플(예: 50개)로 다시 실행해서, 이전(약한 sparse 기준)엔 없었던 "dense 단독을 넘어서는
+  weight"가 새로 생겼는지 확인 필요 — 아직 미실행.

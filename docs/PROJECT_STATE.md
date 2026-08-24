@@ -7,7 +7,7 @@
 > "1. 지금 당장 상태"와 "5. 다음 계획"을 최신으로 고쳐쓸 것. 이 두 가지를 안 하면 다음
 > 세션이 다시 헤맨다.
 
-최종 갱신: 2026-08-21
+최종 갱신: 2026-08-24
 
 ---
 
@@ -36,18 +36,21 @@
 | Chunk 기반 retrieval 실험 (jhgan) | ✅ 완료 — `server/jhgan.py`(chunk_size=200), no-chunk KURE-v1보다 전 지표 우세하나 **모델+chunking 동시 변경이라 confound 있음** (결과: [log.md](log.md) 2026-08-18) |
 | Hybrid(dense+sparse) 실험 (BGE-M3) | ✅ 완료 — `server/bge_hybrid.py`, hybrid가 dense/sparse 단독보다 뚜렷이 우세하나 KURE-v1 no-chunk엔 못 미침 (결과: [log.md](log.md) 2026-08-18) |
 | Chunking 효과 isolate 실험 (KURE-v1 chunk) | ✅ 완료 — `server/kure_chunk.py`(200/500/1000자), **confound 해소: chunking이 지배적 요인**, chunk200이 압도적 1위(recall@1 0.5541, mrr@10 0.661)이나 비용(823,763 chunk, encode 2시간)도 최대 (결과: [log.md](log.md) 2026-08-18) |
-| Vector DB 구축 | ✅ **1차 완료** — FAISS 대신 PostgreSQL+pgvector 채택, Postgres 16 + supervisor 서비스 등록. `chunks_300_overlap100`(823,763행, 11GB, HNSW 인덱스)이 정식 서빙용 테이블로 확정·유지 중. `server/db/schema.sql`+`build_vector_db.py`+`test_val_pgvector.py`는 chunk_size/overlap 임의 조합 지원하도록 일반화 완료 |
+| Vector DB 구축 | ✅ **완료** — `chunks_300_overlap100`(823,763행, 13GB)이 **파인튜닝 모델(kure-v1-finetuned-hard) dense 임베딩 + Kiwi/tsvector 기반 sparse(BM25) 검색 컬럼**을 모두 갖춘 정식 운영 DB로 확정. 인덱스: HNSW(dense)+GIN(sparse)+case_no/case_type(필터). 재구축 중 "기존 인덱스가 붙은 테이블에 COPY하면 극도로 느려짐" 버그 발견+수정(TRUNCATE 전 DROP INDEX 추가) — [log.md](log.md) 2026-08-24 |
 | 임베딩 모델 도메인 파인튜닝 | ✅ **완료** — Phase A(in-batch) + Phase B(hard negative, `--skip-top 5`로 false negative 수정 후) 최종 모델 확정. **base 대비 recall@1 +10.0%p(상대 +17.2%), mrr@10 +9.17%p**. 결과 모델: `server/finetune/output/kure-v1-finetuned-hard/`. 근거: [log.md](log.md) 2026-08-21 |
 | Retriever 평가 자동화 | ✅ 완료 — `server/eval/`(`harness.py`+`retrievers.py`+`run_eval.py`) 신설. `DenseExactRetriever`/`PgvectorRetriever` 구현, sparse/hybrid/rerank 추가 시 retrievers.py에 클래스만 추가하면 됨. 기존 임시 스크립트 7개는 대체 가능(수치는 log.md에 보존, 삭제 여부는 사용자 판단) — [log.md](log.md) 2026-08-20 |
 | RAG 답변 생성 파이프라인 | ❌ 시작 전 (v1 코드 있으나 재사용 여부 미결정, 아래 2절 참고) |
 | 백엔드/배포/운영 | ❌ 시작 전 (v1 코드 있음, 아래 2절 참고) |
 
 **한 줄 요약**: 데이터 준비, 임베딩 모델(KURE-v1) 선정, chunking 전략(chunk_size=300/overlap=100),
-Vector DB 구축(pgvector), **도메인 파인튜닝(Phase A in-batch + Phase B hard negative)까지
-전부 완료.** base KURE-v1 대비 recall@1 +10.0%p(상대 +17.2%), mrr@10 +9.17%p — 이 프로젝트의
-핵심 retriever 파이프라인 1차 완성. 재사용 가능한 평가 하니스(`server/eval/`)도 구축해서
-이후 실험은 새 스크립트 없이 `run_eval.py`로 진행 가능. **다음은 sparse+dense hybrid,
-reranker, MMR, 메타데이터 필터 결합 중 우선순위 정해서 진행** — 상세는 5절 참고.
+도메인 파인튜닝(Phase A in-batch + Phase B hard negative, base 대비 recall@1 +10.0%p),
+Vector DB 구축까지 **전부 완료.** `chunks_300_overlap100`(13GB)이 파인튜닝 모델 dense 임베딩
++ Kiwi/tsvector 기반 sparse(BM25) 컬럼을 모두 갖춘 정식 운영 DB로 확정됨(2026-08-24). 재사용
+가능한 평가 하니스(`server/eval/`)도 구축 완료. **sparse를 진짜 BM25(IDF+k1+b)로 재구현해
+정식 평가까지 마침** (recall@1 0.203→0.5511) — 그러나 균등 가중(1.0/1.0) hybrid는 여전히
+dense 단독(recall@1 0.6826)보다 낮음(0.6309). **다음은 `sparse_weight`를 낮춘 가중 RRF
+소규모 스윕**으로 dense를 넘어서는 조합이 있는지 확인 — 이후 reranker/MMR/메타데이터 필터는
+순서대로 진행, 상세는 5절 참고.
 
 ---
 
@@ -190,10 +193,23 @@ Phase A보다 나빴음(false negative 추정) — `mine_hard_negatives.py --ski
 — base 대비 recall@1 +10.0%p(상대 +17.2%), mrr@10 +9.17%p.
 
 **다음 개선 후보** (2026-08-20 논의, query rewriting은 스코프 제외 결정):
-1. **sparse+dense hybrid** — pgvector에 tsvector/GIN 컬럼만 추가하면 되는 additive 작업
-   (아래 참고), RRF로 dense 결과와 결합. 법률 판례는 법조문 번호·고유명사 등 키워드 매칭이
-   중요한 도메인이라 효과 기대됨(BGE-M3 hybrid 실험에서 sparse 단독도 준수했던 전례 있음,
-   2026-08-18 log.md)
+1. **sparse+dense hybrid — 진짜 BM25로 재구현 + 정식 평가까지 완료, 가중치 스윕만 남음.**
+   Postgres 내장 tsvector+Kiwi 형태소 분석으로 후보만 빠르게 추리고(1단계, SQL/GIN), 그
+   후보들을 진짜 Okapi BM25 공식(IDF+tf포화 k1=1.5+문서길이보정 b=0.75, `ts_stat()`으로
+   미리 캐싱한 IDF/avgdl 사용)으로 재점수하도록 `SparseRetriever` 재작성 완료(BGE-M3 sparse는
+   이 인스턴스 pgvector 0.6.0이 sparsevec 미지원이라 보류, 대신 전통 BM25 하이퍼파라미터
+   튜닝 경로 선택). **정식 평가(val_query.json 7,280개) 결과**: sparse 단독 recall@1
+   0.203→**0.5511**(mrr@10 0.6523)로 극적 개선. 그러나 균등 가중(1.0/1.0) hybrid는 여전히
+   dense 단독(recall@1 0.6826, mrr@10 0.7766)보다 낮음(hybrid recall@1 0.6309, mrr@10
+   0.7247) — 격차는 크게 좁혀짐(-21%p→-5.17%p). 상세 표는 [log.md](log.md) 2026-08-24.
+   **다음: `sparse_weight`를 낮춘 가중 RRF를 소규모 샘플(~50개)로 스윕**해서 dense 단독을
+   넘어서는 조합이 새로 생겼는지 확인(이전 약한 sparse 기준 스윕에선 weight→0으로 갈수록
+   dense에 수렴만 하고 못 넘었음 — sparse가 강해진 지금은 다를 가능성).
+   ⚠️ **알려진 성능 이슈(미해결)**: sparse 쿼리가 ~780ms/쿼리로 느림(dense는 7~13ms) — 법률
+   질문 특유의 긴 키워드 OR 검색이 Postgres GIN 인덱스를 못 쓰고 seq scan으로 빠지는 구조적
+   문제. 흔한 단어(상위 3%) 필터링으로 5.3초→0.78초까지는 개선했으나 그 이상은 못 줄임.
+   **실서비스 latency로 쓰려면 나중에 반드시 재검토 필요**(`pg_search`(ParadeDB) 등 진짜
+   BM25 지원 확장 검토 대상).
 2. **MMR(다양성 재정렬)** — v1에 있었던 요소(FAISS top-50→MMR→rerank top-3)인데 v2엔 아직
    없음. chunk 단위 검색이라 같은/비슷한 chunk가 상위권을 도배할 수 있어 v1보다 오히려 더
    필요할 수 있음
