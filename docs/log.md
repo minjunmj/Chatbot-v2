@@ -742,3 +742,53 @@ Phase 2 첫 작업으로 KURE-v1 도메인 파인튜닝 설계를 논의하고 1
 - **다음**: `bge-reranker-v2-m3`로 cross-encoder reranker 구현 → `server/eval/retrievers.py`에
   Reranker 클래스 추가(top-20~30 pgvector(ef_search=200) 후보를 CrossEncoder로 재정렬) →
   소규모 샘플 검증 후 정식 평가.
+
+## 2026-08-25 — CrossEncoderReranker 구현+평가, off-the-shelf reranker가 dense보다 나쁨 → 파인튜닝 착수
+
+- **`CrossEncoderReranker` 구현** (`server/eval/retrievers.py`): 1단계(pgvector/HNSW)로
+  top_n(기본 30)개 후보를 뽑고 2단계(cross-encoder)로 (query, chunk_text) 쌍을 재점수·재정렬.
+  `run_eval.py --mode rerank` 추가, `harness.py`의 배치 단위 tqdm이 rerank처럼 느린 모드엔
+  갱신 간격이 너무 뜸해서 `CrossEncoderReranker.retrieve_batch` 안에 쿼리 단위 tqdm(leave=False)
+  한 겹 더 추가.
+- **정식(7,280개) 평가 — 예상 밖으로 dense 단독보다 나쁨**: `bge-reranker-v2-m3`(범용,
+  한국어 법률 도메인 미세조정 안 됨)로 돌린 결과, 같은 ef_search=100 기준:
+
+  | | dense 단독(ef=100) | rerank(top_n=30, ef=100) |
+  |---|---|---|
+  | recall@1 | 0.6710 | 0.6308 (-4.02%p) |
+  | recall@5 | 0.8902 | 0.8663 (-2.39%p) |
+  | recall@10 | 0.9316 | 0.9188 (-1.28%p) |
+  | recall@20 | 0.9565 | 0.9526 (-0.39%p) |
+  | recall@30 | 0.9657 | 0.9657 (동일 — 구조상 당연, pool 안 순서만 바뀜) |
+  | mrr@10 | 0.7645 | 0.7305 (-3.40%p) |
+  | latency | 11.66ms | 421.04ms (36배) |
+
+  recall@30이 정확히 일치하는 건 reranker가 pool 안에서 순서만 바꾸고 pool 자체(recall
+  상한)는 못 바꾼다는 구조적 사실과 일치 — 구현이 맞다는 sanity check. 문제는 recall@1/5/10/20이
+  전부 dense보다 나빠졌다는 것 — 범용 cross-encoder가 이미 도메인 파인튜닝된 dense의 1등
+  픽을 오히려 밀어내는 경우가 더 많았다는 뜻. sparse+hybrid 때와 같은 패턴("도메인 파인튜닝
+  안 된 범용 방법이 이미 강한 도메인 dense를 못 이김")으로 추정.
+- **결정: cross-encoder도 도메인 파인튜닝 시도** — KURE-v1 dense 모델을 base 위에 이어서
+  학습해 +10%p 얻었던 것과 같은 전략을 reranker에도 적용. 새 스크립트 2개 작성(기존
+  `prepare_data.py`/`train.py`/`mine_hard_negatives.py`는 안 건드리고 별도 파일로 분리):
+  - **`server/finetune/prepare_reranker_data.py`(신규)**: `prepare_data.py`+
+    `mine_hard_negatives.py`를 합친 것과 비슷하지만, 코퍼스 전체를 로컬 .npy 캐시로 GPU에
+    올리는 대신 **pgvector(HNSW)를 그대로 사용** — 코퍼스를 로컬로 다시 끌어올 필요가
+    없어서 디스크 추가 소요 0(지금 디스크 여유로는 예전 방식의 로컬 corpus 캐시를 감당
+    못 함). 또한 hard negative를 Phase A가 아니라 **지금 서빙 중인 최종 모델
+    (kure-v1-finetuned-hard)** 기준으로 채굴 — 실제 서빙에서 reranker가 보게 될 후보
+    분포를 반영. (anchor=query, positive=정답 문서 내 최유사 chunk, negative_chunks=
+    hard negative 여러 개) triplet을 `reranker_pairs.jsonl`에 저장.
+  - **`server/finetune/train_reranker.py`(신규)**: `bge-reranker-v2-m3`를 base로
+    `CrossEncoderTrainer`+`MultipleNegativesRankingLoss`(dense Phase A/B와 같은 InfoNCE
+    계열)로 이어서 학습. **⚠️ 디스크 안전장치**: base 모델 로드 직후(가중치가 이미
+    메모리에 다 올라간 시점) HF 캐시 폴더를 바로 삭제 — 안 그러면 학습 완료 후 파인튜닝
+    모델(~2.2GB) 저장 시점에 base 캐시(~2.2GB)와 동시에 존재해야 해서 도합 4.4GB 필요한데
+    지금 여유(<2GB)로는 불가능함. `huggingface_hub.scan_cache_dir()`로 정확한 캐시 경로를
+    찾아서 삭제.
+  - 15개 샘플로 두 스크립트 다 end-to-end 검증 완료(데이터 생성 → 학습 3스텝 → 저장,
+    디스크 안전장치가 실제로 2.29GB 회수하는 것도 확인) — 테스트 산출물은 정리함.
+- **다음**: `prepare_reranker_data.py`(train_query.json 41,319개 전체) → `train_reranker.py`
+  전체 실행(사용자) → 파인튜닝된 reranker로 `run_eval.py --mode rerank --rerank-model-path
+  ./output/bge-reranker-v2-m3-finetuned` 재평가해서 off-the-shelf 대비, dense 단독 대비
+  개선 여부 확인.

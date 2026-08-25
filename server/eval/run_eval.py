@@ -17,6 +17,9 @@ kure_chunk_overlap.py/test_val_pgvector.py/finetune/eval_model.py가 하던 걸 
     # hybrid (dense+sparse, RRF 결합) — --model-path 필요(dense용)
     python run_eval.py --mode hybrid --model-path ../finetune/output/kure-v1-finetuned-hard --table chunks_300_overlap100
 
+    # rerank (dense top_n 후보를 cross-encoder로 재정렬) — --model-path(dense용)+--rerank-model-path 필요
+    python run_eval.py --mode rerank --model-path ../finetune/output/kure-v1-finetuned-hard --rerank-model-path BAAI/bge-reranker-v2-m3 --table chunks_300_overlap100 --top-n 30
+
     # 빠른 확인용 쿼리 수 제한
     python run_eval.py --mode exact --model-path nlpai-lab/KURE-v1 --chunk-size 300 --overlap 100 --limit 500
 """
@@ -33,7 +36,8 @@ import torch
 from sentence_transformers import SentenceTransformer
 
 from harness import evaluate
-from retrievers import DenseExactRetriever, PgvectorRetriever, SparseRetriever, HybridRetriever
+from retrievers import (DenseExactRetriever, PgvectorRetriever, SparseRetriever, HybridRetriever,
+                         CrossEncoderReranker)
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # server/
 DB_DIR = os.path.join(BASE_DIR, "..", "data", "DB_data")
@@ -122,8 +126,12 @@ def encode_corpus_cached(model, chunk_texts, cache_path, batch_size=32):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", required=True, choices=["exact", "pgvector", "sparse", "hybrid"])
-    parser.add_argument("--model-path", help="exact/pgvector/hybrid 필수 (sparse는 불필요, dense 모델 안 씀)")
+    parser.add_argument("--mode", required=True, choices=["exact", "pgvector", "sparse", "hybrid", "rerank"])
+    parser.add_argument("--model-path", help="exact/pgvector/hybrid/rerank 필수 (sparse는 불필요, dense 모델 안 씀)")
+    parser.add_argument("--rerank-model-path", help="--mode rerank 필수, cross-encoder 모델 (예: BAAI/bge-reranker-v2-m3)")
+    parser.add_argument("--top-n", type=int, default=30,
+                         help="--mode rerank 전용, cross-encoder로 재정렬할 dense 후보 수 (기본 30 — "
+                              "ef_search=200 기준 recall@30=0.9725, log.md 2026-08-25)")
     parser.add_argument("--chunk-size", type=int, help="--mode exact 필수")
     parser.add_argument("--overlap", type=int, default=0, help="--mode exact 전용, 기본 0")
     parser.add_argument("--table", help="--mode pgvector/sparse/hybrid 필수 (예: chunks_300_overlap100)")
@@ -143,7 +151,7 @@ def main():
     print(f"평가 쿼리 수: {len(val_data)}")
 
     model = None
-    if args.mode in ("exact", "pgvector", "hybrid"):
+    if args.mode in ("exact", "pgvector", "hybrid", "rerank"):
         if not args.model_path:
             raise ValueError(f"--mode {args.mode}는 --model-path 필수")
         print(f"모델 로딩: {args.model_path}")
@@ -176,7 +184,7 @@ def main():
         conn = psycopg2.connect(DATABASE_URL)
         retriever = SparseRetriever(conn, args.table)
 
-    else:  # hybrid
+    elif args.mode == "hybrid":
         if not args.table:
             raise ValueError("--mode hybrid는 --table 필수")
         import psycopg2
@@ -184,6 +192,16 @@ def main():
         dense = PgvectorRetriever(model, conn, args.table, ef_search=args.ef_search)
         sparse = SparseRetriever(conn, args.table)
         retriever = HybridRetriever(dense, sparse, dense_weight=args.dense_weight, sparse_weight=args.sparse_weight)
+
+    else:  # rerank
+        if not args.table:
+            raise ValueError("--mode rerank는 --table 필수")
+        if not args.rerank_model_path:
+            raise ValueError("--mode rerank는 --rerank-model-path 필수")
+        import psycopg2
+        conn = psycopg2.connect(DATABASE_URL)
+        retriever = CrossEncoderReranker(model, args.rerank_model_path, conn, args.table,
+                                          top_n=args.top_n, ef_search=args.ef_search, device=DEVICE)
 
     k_list = tuple(int(k) for k in args.k_list.split(","))
     result = evaluate(retriever, val_data, k_list=k_list, measure_latency=args.measure_latency)

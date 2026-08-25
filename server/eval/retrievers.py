@@ -12,6 +12,7 @@ from collections import Counter
 
 import numpy as np
 import torch
+from tqdm import tqdm
 
 
 def l2norm(x):
@@ -260,4 +261,75 @@ class HybridRetriever:
                 scores[cid] = scores.get(cid, 0.0) + self.sparse_weight / (self.k + rank)
             ranked = sorted(scores, key=scores.get, reverse=True)[:max_k]
             results.append(ranked)
+        return results
+
+
+class CrossEncoderReranker:
+    """1단계(dense, pgvector/HNSW)로 top_n개 후보를 빠르게 추리고, 2단계(cross-encoder)로
+    (query, chunk_text) 쌍을 그 자리에서 같이 인코딩해 재점수·재정렬하는 reranker.
+
+    ColBERT와 달리 코퍼스를 미리 인코딩해서 저장해두는 게 없음(그래서 디스크 추가 소요 0,
+    ColBERT는 chunk당 토큰 수만큼 벡터 저장이 필요해 이 인스턴스 디스크 예산(32GB 고정,
+    2026-08-25 기준 여유 3.9GB)을 훌쩍 넘어서 배제됨) — 대신 cross-encoder는 후보 하나하나를
+    쿼리와 함께 매번 forward pass 해야 해서 후보 수에 비례해 느려짐. `top_n` 기본값 30은
+    ef_search=200 기준 recall@30=0.9725(log.md 2026-08-25)면 대부분의 정답이 이미 이 pool
+    안에 있다는 실측 근거로 잡은 값 — 이보다 넓혀도 얻는 recall은 적고 latency만 커짐.
+
+    1단계 SQL은 PgvectorRetriever와 같은 패턴(넉넉한 pool을 거리순으로 먼저 뽑고 그 안에서
+    case_no dedupe)이지만, 재랭킹에 필요한 chunk_text까지 같이 가져와야 해서 별도로 구현함."""
+
+    def __init__(self, dense_model, cross_encoder_path, conn, table, top_n=30, ef_search=200,
+                 device="cuda", query_batch_size=32, rerank_batch_size=32):
+        from sentence_transformers import CrossEncoder
+        self.dense_model = dense_model
+        self.cross_encoder = CrossEncoder(cross_encoder_path, device=device, max_length=512)
+        self.conn = conn
+        self.table = table
+        self.top_n = top_n
+        self.query_batch_size = query_batch_size
+        self.rerank_batch_size = rerank_batch_size
+        with self.conn.cursor() as cur:
+            cur.execute("SET hnsw.ef_search = %s", (ef_search,))
+
+    @staticmethod
+    def _pg_vector_literal(vec):
+        return "[" + ",".join(f"{x:.6f}" for x in vec) + "]"
+
+    def retrieve_batch(self, queries, max_k):
+        query_embs = l2norm(self.dense_model.encode(
+            queries, batch_size=self.query_batch_size, show_progress_bar=False,
+            convert_to_numpy=True, normalize_embeddings=True,
+        ).astype(np.float32))
+
+        # case_no dedupe 후에도 top_n개가 남으려면 넉넉한 pool에서 시작해야 함(PgvectorRetriever
+        # 주석 참고) — top_n의 10배 정도면 충분히 여유 있음
+        pool_k = self.top_n * 10
+
+        results = []
+        with self.conn.cursor() as cur:
+            # harness.py의 tqdm은 배치(64개) 단위라 rerank처럼 쿼리 하나당 cross-encoder를
+            # top_n번씩 돌려야 해서 느린 경우엔 갱신 간격이 너무 뜸함 — 쿼리 단위로 한 번 더
+            # 감쌈(leave=False라 배치 진행률 바로 아래 한 줄만 쓰고 사라짐, 여러 줄 안 쌓임)
+            for query, vec in tqdm(list(zip(queries, query_embs)), desc="rerank", leave=False, ncols=80):
+                lit = self._pg_vector_literal(vec)
+                cur.execute(
+                    f"WITH nearest AS ("
+                    f"    SELECT case_no, chunk_text, embedding <=> %s AS dist FROM {self.table} "
+                    f"    ORDER BY embedding <=> %s LIMIT {pool_k}"
+                    f") "
+                    f"SELECT DISTINCT ON (case_no) case_no, chunk_text, dist FROM nearest "
+                    f"ORDER BY case_no, dist",
+                    (lit, lit),
+                )
+                rows = sorted(cur.fetchall(), key=lambda r: r[2])[:self.top_n]
+                if not rows:
+                    results.append([])
+                    continue
+
+                pairs = [(query, r[1]) for r in rows]
+                scores = self.cross_encoder.predict(
+                    pairs, batch_size=self.rerank_batch_size, show_progress_bar=False)
+                order = np.argsort(-np.asarray(scores))
+                ranked = [rows[i][0] for i in order][:max_k]
+                results.append(ranked)
         return results
