@@ -792,3 +792,40 @@ Phase 2 첫 작업으로 KURE-v1 도메인 파인튜닝 설계를 논의하고 1
   전체 실행(사용자) → 파인튜닝된 reranker로 `run_eval.py --mode rerank --rerank-model-path
   ./output/bge-reranker-v2-m3-finetuned` 재평가해서 off-the-shelf 대비, dense 단독 대비
   개선 여부 확인.
+
+## 2026-08-25 — reranker 도메인 파인튜닝 성공, dense 단독을 전 지표에서 넘어섬 → 최종 retriever 파이프라인 확정
+
+- **파인튜닝 실행**(사용자, train_query.json 41,319개 전체): `prepare_reranker_data.py` →
+  `train_reranker.py`(1 epoch, batch_size=16, lr=1e-5) 정상 완료. 저장된 모델:
+  `server/finetune/output/bge-reranker-v2-m3-finetuned/`(2.2GB). 디스크 안전장치(base 캐시
+  로드 직후 삭제)가 실제로 작동해서 디스크 부족 없이 저장까지 완료됨(여유 1.6GB로 빠듯했지만
+  통과).
+- **정식(7,280개) 평가 — dense 단독을 전 지표에서 확실히 넘어섬**:
+
+  | | dense 단독(ef=200) | off-the-shelf rerank(ef=100) | **파인튜닝 rerank(ef=200)** |
+  |---|---|---|---|
+  | recall@1 | 0.6768 | 0.6308 | **0.7446** (dense 대비 +6.78%p) |
+  | recall@5 | 0.8975 | 0.8663 | **0.9273** |
+  | recall@10 | 0.9386 | 0.9188 | **0.9543** |
+  | recall@20 | 0.9635 | 0.9526 | **0.9690** |
+  | recall@30 | 0.9725 | 0.9657 | 0.9725 (동일 — pool 안 순서만 바뀌므로 구조상 당연) |
+  | mrr@10 | 0.7707 | 0.7305 | **0.8246** (dense 대비 +5.39%p) |
+  | latency | 19.47ms | 421.04ms | 442.16ms |
+
+  (off-the-shelf 비교는 ef_search=100 기준이라 파인튜닝 결과(ef=200)와 엄밀한 apples-to-apples는
+  아님 — ef_search 자체의 기여는 최대 +0.6%p 수준(위 ef 스윕 결과 참고)이라 나머지 대부분은
+  파인튜닝 효과로 봐도 무방함.)
+- **KURE-v1 dense 파인튜닝과 동일한 패턴 재현**: 범용 모델(off-the-shelf)은 도메인에서 dense
+  단독보다 오히려 못했는데(-4.02%p), 같은 도메인 데이터로 이어서 학습하니 dense를 확실히
+  앞지름(+6.78%p) — "범용은 이 도메인에서 실패, 도메인 파인튜닝은 성공"이 이 프로젝트에서
+  두 번째로 검증된 사례(dense는 +10.0%p, reranker는 +6.78%p, 둘 다 같은 전략·같은 크기의
+  개선 방향).
+- **결정: 최종 retriever 파이프라인을 "dense 단독"에서 "dense(ef=200) top-30 → 파인튜닝
+  cross-encoder reranker"로 갱신.** dense 단독 확정 결정(2026-08-25 앞부분 항목)은 이걸로
+  갱신됨 — sparse/hybrid는 여전히 미채택(코드만 보존)이고, 이번에 reranker 단계가 새로
+  파이프라인에 추가된 것.
+- **미해결 트레이드오프**: latency가 dense 단독(19.5ms) 대비 22배(442ms) — 실제 서빙에 그대로
+  쓸지는 정확도-응답속도 트레이드오프 판단이 필요함. 개선 아이디어(top_n 축소, batch 처리,
+  quantization 등)는 아래 "다음" 참고.
+- **다음**: (1) 응답 latency를 실사용 가능한 수준으로 낮추는 방법 검토(top_n 줄이기,
+  cross-encoder 자체 최적화 등), (2) 로드맵의 나머지 항목(MMR, 메타데이터 필터)으로 진행.

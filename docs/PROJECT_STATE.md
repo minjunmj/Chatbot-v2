@@ -43,7 +43,7 @@
 | ef_search 튜닝 | ✅ 완료 — 정식(7,280개) recall@k(20/30/40/50까지 확장)+latency로 100/200/300 비교, **ef_search=200 채택**(정확도 개선 대비 100→200은 크고 200→300은 수확체감, latency는 19.5ms로 여유) — [log.md](log.md) 2026-08-25 |
 | Reranker 방식 결정 | ✅ **완료 — ColBERT 배제, cross-encoder로 확정.** ColBERT는 chunk당 토큰 수만큼 벡터를 저장해야 해서 어림 60GB대 필요(압축해도 5~10GB) — 이 인스턴스 디스크(32GB 고정, 여유 3.9GB)로는 불가능. cross-encoder는 코퍼스를 미리 인코딩/저장하지 않는 구조라 추가 디스크 불필요(모델 가중치만 필요) — [log.md](log.md) 2026-08-25 |
 | Reranker(off-the-shelf) 평가 | ✅ 완료 — `CrossEncoderReranker`(`server/eval/retrievers.py`) 구현, `bge-reranker-v2-m3`로 정식(7,280개) 평가. **예상 밖으로 dense 단독보다 전 지표 나쁨**(recall@1 0.6710→0.6308, mrr@10 0.7645→0.7305, latency 11.66ms→421ms) — 범용 cross-encoder가 도메인 파인튜닝된 dense의 1등 픽을 오히려 밀어냄. sparse+hybrid 때와 같은 "도메인 미세조정 안 된 범용 방법이 강한 dense를 못 이김" 패턴 — [log.md](log.md) 2026-08-25 |
-| Reranker 도메인 파인튜닝 | 🔄 **진행 중** — KURE-v1과 같은 전략(base 위에 이어서 학습)을 cross-encoder에도 적용. 신규 스크립트 `server/finetune/prepare_reranker_data.py`(pgvector 기반 hard negative 채굴, 로컬 corpus 캐시 불필요)+`train_reranker.py`(`CrossEncoderTrainer`+`MultipleNegativesRankingLoss`, base 캐시를 로드 직후 삭제하는 디스크 안전장치 포함) 작성+15개 샘플 검증 완료. **다음: 전체(41,319개) 실행은 사용자** — [log.md](log.md) 2026-08-25 |
+| Reranker 도메인 파인튜닝 | ✅ **완료 — dense 단독을 전 지표에서 넘어섬.** KURE-v1과 같은 전략(base 위에 이어서 학습)을 cross-encoder에 적용(`prepare_reranker_data.py`+`train_reranker.py`, train_query.json 41,319개). 정식(7,280개) 평가: recall@1 0.6768→**0.7446**(dense 단독 대비 +6.78%p), mrr@10 0.7707→**0.8246**(+5.39%p). off-the-shelf가 dense보다 못했던 것(-4.02%p)과 정반대 — dense 파인튜닝(+10.0%p) 때와 동일한 "범용 실패, 도메인 파인튜닝 성공" 패턴 재현. **최종 retriever 파이프라인을 "dense(ef=200) top-30 → 파인튜닝 reranker"로 확정.** latency는 442ms(dense 단독 대비 22배)로 트레이드오프 존재 — [log.md](log.md) 2026-08-25 |
 | RAG 답변 생성 파이프라인 | ❌ 시작 전 (v1 코드 있으나 재사용 여부 미결정, 아래 2절 참고) |
 | 백엔드/배포/운영 | ❌ 시작 전 (v1 코드 있음, 아래 2절 참고) |
 
@@ -52,12 +52,13 @@
 Vector DB 구축까지 **전부 완료.** `chunks_300_overlap100`(13GB)이 파인튜닝 모델 dense 임베딩
 + Kiwi/tsvector 기반 sparse(BM25) 컬럼을 모두 갖춘 정식 운영 DB로 확정됨(2026-08-24).
 **sparse+dense hybrid는 진짜 BM25까지 구현해 정식 스윕(sparse_weight 1.0~0.15)까지
-마쳤으나 dense 단독을 못 넘어서 미채택 결정 — retriever는 dense 단독(recall@1 0.6826,
-mrr@10 0.7766, 서빙은 ef_search=200)으로 최종 확정**(코드는 보존, [log.md](log.md)
-2026-08-25). **reranker는 ColBERT를 디스크 용량 문제로 배제하고 cross-encoder로 진행 중**
-— off-the-shelf `bge-reranker-v2-m3`는 정식 평가 결과 dense 단독보다 오히려 나빠서
-(recall@1 -4.02%p), 지금 **도메인 파인튜닝 착수**(스크립트 작성+소규모 검증 완료, 전체
-실행 대기) — 이후 MMR/메타데이터 필터는 순서대로 진행, 상세는 5절 참고.
+마쳤으나 dense 단독을 못 넘어서 미채택**(코드는 보존, [log.md](log.md) 2026-08-25).
+**reranker는 ColBERT를 디스크 용량 문제로 배제하고 cross-encoder로 진행 — off-the-shelf
+`bge-reranker-v2-m3`는 dense 단독보다 오히려 나빴지만(recall@1 -4.02%p), KURE-v1과 같은
+전략으로 도메인 파인튜닝하니 dense를 확실히 앞지름(recall@1 +6.78%p, mrr@10 +5.39%p).
+**최종 retriever 파이프라인: dense(ef=200) top-30 → 파인튜닝 cross-encoder reranker**로
+확정**(latency 442ms, 이후 필요시 최적화 여지 있음) — 이후 MMR/메타데이터 필터는 순서대로
+진행, 상세는 5절 참고.
 
 ---
 
@@ -210,23 +211,22 @@ Phase A보다 나빴음(false negative 추정) — `mine_hard_negatives.py --ski
    삭제하지 않고 보존(포트폴리오 근거 자료 + 추후 다른 dense 모델로 재검토 가능성 대비).
    상세: [log.md](log.md) 2026-08-24~25. (sparse 쿼리 ~780ms/쿼리로 느린 성능 이슈는 미해결로
    남지만, 채택 안 하기로 했으니 지금은 재검토 우선순위 낮음.)
-1. **Reranker(CrossEncoder) — 도메인 파인튜닝 진행 중.** ColBERT도 후보로 검토했으나 chunk당
-   토큰 수만큼 벡터를 저장해야 해서(어림 60GB대, 압축해도 5~10GB대) 이 인스턴스 디스크(32GB
-   고정, 여유 3.9GB)로는 불가능 — **cross-encoder로 확정**(코퍼스 사전 인코딩/저장이 없어
-   추가 디스크 불필요). off-the-shelf `bge-reranker-v2-m3`(`CrossEncoderReranker`,
-   `server/eval/retrievers.py`)로 정식 평가했더니 **dense 단독보다 전 지표 나쁨**(recall@1
-   0.6710→0.6308, latency 11.66ms→421ms) — 범용이라 도메인 미세조정 안 된 게 원인으로
-   추정. KURE-v1과 같은 전략(base 이어서 학습)으로 **도메인 파인튜닝 착수**: 신규
-   `server/finetune/prepare_reranker_data.py`(pgvector 기반 hard negative 채굴)+
-   `train_reranker.py`(`CrossEncoderTrainer`+`MultipleNegativesRankingLoss`, base 캐시를
-   로드 직후 삭제하는 디스크 안전장치 포함) 작성+15개 샘플 검증 완료, **전체(41,319개)
-   실행은 사용자 몫으로 대기 중**. 근거: [log.md](log.md) 2026-08-25.
-2. **MMR(다양성 재정렬)** — v1에 있었던 요소(FAISS top-50→MMR→rerank top-3)인데 v2엔 아직
-   없음. chunk 단위 검색이라 같은/비슷한 chunk가 상위권을 도배할 수 있어 v1보다 오히려 더
-   필요할 수 있음
-3. **메타데이터 필터 결합** — "형사 사건 중 2015년 이후" 같은 구조화 질의 처리 (SelfQuery
+0. ✅ **Reranker(CrossEncoder) — 도메인 파인튜닝까지 완료, dense 단독을 넘어섬.** ColBERT는
+   디스크 용량 문제로 배제(chunk당 토큰 수만큼 벡터 저장 필요, 어림 60GB대 — 이 인스턴스
+   32GB 고정 디스크로 불가능), cross-encoder로 확정. off-the-shelf `bge-reranker-v2-m3`는
+   dense 단독보다 오히려 나빴지만(recall@1 -4.02%p), `prepare_reranker_data.py`(pgvector
+   기반 hard negative 채굴)+`train_reranker.py`(`CrossEncoderTrainer`+
+   `MultipleNegativesRankingLoss`, base 캐시 즉시 삭제하는 디스크 안전장치 포함)로
+   KURE-v1과 같은 전략의 도메인 파인튜닝 후 재평가하니 **recall@1 +6.78%p, mrr@10 +5.39%p
+   — dense 단독을 전 지표에서 넘어섬.** **최종 파이프라인: dense(ef=200) top-30 →
+   파인튜닝 reranker로 확정.** latency 442ms(dense 대비 22배)는 트레이드오프로 남음 —
+   실서비스 적용 시 top_n 축소 등 최적화 검토 필요. 근거: [log.md](log.md) 2026-08-25.
+1. **MMR(다양성 재정렬) — 다음 작업.** v1에 있었던 요소(FAISS top-50→MMR→rerank top-3)인데
+   v2엔 아직 없음. chunk 단위 검색이라 같은/비슷한 chunk가 상위권을 도배할 수 있어 v1보다
+   오히려 더 필요할 수 있음
+2. **메타데이터 필터 결합** — "형사 사건 중 2015년 이후" 같은 구조화 질의 처리 (SelfQuery
    방식, LLM으로 필터+의미쿼리 분리 — 초반 논의 참고). 정확도보다는 실사용 기능 완성도 항목
-4. **평가는 전부 `server/eval/run_eval.py`로** — 새 검색 방법마다 `retrievers.py`에
+3. **평가는 전부 `server/eval/run_eval.py`로** — 새 검색 방법마다 `retrievers.py`에
    Retriever 클래스만 추가하면 됨 (2026-08-20 하니스 신설, 상세는 아래)
 
 **평가 하니스** (완료, 2026-08-20, [log.md](log.md) 참고):
