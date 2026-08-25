@@ -128,6 +128,10 @@ def main():
     parser.add_argument("--overlap", type=int, default=0, help="--mode exact 전용, 기본 0")
     parser.add_argument("--table", help="--mode pgvector/sparse/hybrid 필수 (예: chunks_300_overlap100)")
     parser.add_argument("--limit", type=int, default=None, help="빠른 확인용 쿼리 수 제한")
+    parser.add_argument("--k-list", type=str, default="1,5,10,20",
+                         help="recall@k를 계산할 k값들, 콤마로 구분 (예: 1,5,10,20,30,40,50)")
+    parser.add_argument("--ef-search", type=int, default=100,
+                         help="--mode pgvector/hybrid 전용, HNSW ef_search (기본 100, 클수록 정확하나 느려짐)")
     parser.add_argument("--measure-latency", action="store_true")
     parser.add_argument("--dense-weight", type=float, default=1.0, help="--mode hybrid 전용, RRF 가중치")
     parser.add_argument("--sparse-weight", type=float, default=1.0,
@@ -163,7 +167,7 @@ def main():
             raise ValueError("--mode pgvector는 --table 필수")
         import psycopg2
         conn = psycopg2.connect(DATABASE_URL)
-        retriever = PgvectorRetriever(model, conn, args.table)
+        retriever = PgvectorRetriever(model, conn, args.table, ef_search=args.ef_search)
 
     elif args.mode == "sparse":
         if not args.table:
@@ -177,11 +181,12 @@ def main():
             raise ValueError("--mode hybrid는 --table 필수")
         import psycopg2
         conn = psycopg2.connect(DATABASE_URL)
-        dense = PgvectorRetriever(model, conn, args.table)
+        dense = PgvectorRetriever(model, conn, args.table, ef_search=args.ef_search)
         sparse = SparseRetriever(conn, args.table)
         retriever = HybridRetriever(dense, sparse, dense_weight=args.dense_weight, sparse_weight=args.sparse_weight)
 
-    result = evaluate(retriever, val_data, measure_latency=args.measure_latency)
+    k_list = tuple(int(k) for k in args.k_list.split(","))
+    result = evaluate(retriever, val_data, k_list=k_list, measure_latency=args.measure_latency)
     print("\n===== 결과 =====")
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
