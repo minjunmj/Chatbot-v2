@@ -36,7 +36,7 @@
 | Chunk 기반 retrieval 실험 (jhgan) | ✅ 완료 — `server/jhgan.py`(chunk_size=200), no-chunk KURE-v1보다 전 지표 우세하나 **모델+chunking 동시 변경이라 confound 있음** (결과: [log.md](log.md) 2026-08-18) |
 | Hybrid(dense+sparse) 실험 (BGE-M3) | ✅ 완료 — `server/bge_hybrid.py`, hybrid가 dense/sparse 단독보다 뚜렷이 우세하나 KURE-v1 no-chunk엔 못 미침 (결과: [log.md](log.md) 2026-08-18) |
 | Chunking 효과 isolate 실험 (KURE-v1 chunk) | ✅ 완료 — `server/kure_chunk.py`(200/500/1000자), **confound 해소: chunking이 지배적 요인**, chunk200이 압도적 1위(recall@1 0.5541, mrr@10 0.661)이나 비용(823,763 chunk, encode 2시간)도 최대 (결과: [log.md](log.md) 2026-08-18) |
-| Vector DB 구축 | ✅ **완료** — `chunks_300_overlap100`(823,763행, 13GB)이 **파인튜닝 모델(kure-v1-finetuned-hard) dense 임베딩 + Kiwi/tsvector 기반 sparse(BM25) 검색 컬럼**을 모두 갖춘 정식 운영 DB로 확정. 인덱스: HNSW(dense)+GIN(sparse)+case_no/case_type(필터). 재구축 중 "기존 인덱스가 붙은 테이블에 COPY하면 극도로 느려짐" 버그 발견+수정(TRUNCATE 전 DROP INDEX 추가) — [log.md](log.md) 2026-08-24 |
+| Vector DB 구축 | ✅ **완료** — `chunks_300_overlap100`(823,763행, 13GB)이 **파인튜닝 모델(kure-v1-finetuned-hard) dense 임베딩**을 갖춘 정식 운영 DB로 확정. 인덱스: HNSW(dense)+case_no/case_type(필터). 재구축 중 "기존 인덱스가 붙은 테이블에 COPY하면 극도로 느려짐" 버그 발견+수정(TRUNCATE 전 DROP INDEX 추가) — [log.md](log.md) 2026-08-24. (Kiwi/tsvector sparse 컬럼+GIN 인덱스는 sparse/hybrid 미채택 결정 후 2026-08-25 제거 — 컬럼은 논리적으로 drop됐으나 물리적 디스크(~700MB)는 `VACUUM FULL` 필요 시 추후 회수, [log.md](log.md) 2026-08-25) |
 | 임베딩 모델 도메인 파인튜닝 | ✅ **완료** — Phase A(in-batch) + Phase B(hard negative, `--skip-top 5`로 false negative 수정 후) 최종 모델 확정. **base 대비 recall@1 +10.0%p(상대 +17.2%), mrr@10 +9.17%p**. 결과 모델: `server/finetune/output/kure-v1-finetuned-hard/`. 근거: [log.md](log.md) 2026-08-21 |
 | Retriever 평가 자동화 | ✅ 완료 — `server/eval/`(`harness.py`+`retrievers.py`+`run_eval.py`) 신설. `DenseExactRetriever`/`PgvectorRetriever` 구현, sparse/hybrid/rerank 추가 시 retrievers.py에 클래스만 추가하면 됨. 기존 임시 스크립트 7개는 대체 가능(수치는 log.md에 보존, 삭제 여부는 사용자 판단) — [log.md](log.md) 2026-08-20 |
 | Sparse/Hybrid(dense+BM25) 검토 | ✅ **완료 — 검토 후 미채택, dense 단독으로 확정.** Postgres tsvector+Kiwi로 진짜 BM25(IDF+k1+b)까지 구현해 sparse 단독 recall@1 0.203→0.5511까지 끌어올렸으나, `sparse_weight`를 0.15까지 낮춰가며 정식(7,280개) 스윕해도 hybrid가 dense 단독(recall@1 0.6826)을 전 지표에서 못 넘음 — "이 dense 모델이 이미 이 도메인에 충분히 강해서 sparse가 보탤 여지가 없다"로 결론. 코드(`SparseRetriever`/`HybridRetriever`)는 삭제하지 않고 `server/eval/retrievers.py`에 보존(포트폴리오 근거 자료 + 추후 재검토 대비) — [log.md](log.md) 2026-08-25 |
@@ -44,21 +44,23 @@
 | Reranker 방식 결정 | ✅ **완료 — ColBERT 배제, cross-encoder로 확정.** ColBERT는 chunk당 토큰 수만큼 벡터를 저장해야 해서 어림 60GB대 필요(압축해도 5~10GB) — 이 인스턴스 디스크(32GB 고정, 여유 3.9GB)로는 불가능. cross-encoder는 코퍼스를 미리 인코딩/저장하지 않는 구조라 추가 디스크 불필요(모델 가중치만 필요) — [log.md](log.md) 2026-08-25 |
 | Reranker(off-the-shelf) 평가 | ✅ 완료 — `CrossEncoderReranker`(`server/eval/retrievers.py`) 구현, `bge-reranker-v2-m3`로 정식(7,280개) 평가. **예상 밖으로 dense 단독보다 전 지표 나쁨**(recall@1 0.6710→0.6308, mrr@10 0.7645→0.7305, latency 11.66ms→421ms) — 범용 cross-encoder가 도메인 파인튜닝된 dense의 1등 픽을 오히려 밀어냄. sparse+hybrid 때와 같은 "도메인 미세조정 안 된 범용 방법이 강한 dense를 못 이김" 패턴 — [log.md](log.md) 2026-08-25 |
 | Reranker 도메인 파인튜닝 | ✅ **완료 — dense 단독을 전 지표에서 넘어섬.** KURE-v1과 같은 전략(base 위에 이어서 학습)을 cross-encoder에 적용(`prepare_reranker_data.py`+`train_reranker.py`, train_query.json 41,319개). 정식(7,280개) 평가(top_n=30): recall@1 0.6768→**0.7446**(dense 단독 대비 +6.78%p), recall@3 **0.8971**, mrr@10 0.7707→**0.8246**(+5.39%p). off-the-shelf가 dense보다 못했던 것(-4.02%p)과 정반대 — dense 파인튜닝(+10.0%p) 때와 동일한 "범용 실패, 도메인 파인튜닝 성공" 패턴 재현. **최종 retriever 파이프라인을 "dense(ef=200) top-30 → 파인튜닝 reranker"로 확정.** latency 442ms(dense 단독 대비 22배)는 UX 응답시간 기준(1초 미만)에 들어오고 top_n=10 축소 시 recall 손해가 더 커 보여 **top_n=30 유지로 잠정 결론** — [log.md](log.md) 2026-08-25 |
-| RAG 답변 생성 파이프라인 | ❌ 시작 전 (v1 코드 있으나 재사용 여부 미결정, 아래 2절 참고) |
+| RAG 답변 생성 파이프라인 | 🔄 **착수 — 최소 버전 첫 end-to-end 성공.** `server/generate.py` 신설: dense+reranker로 top-5 판례 검색 → 판례 원문 전체(`data/DB_data/{case_no}.json`)를 컨텍스트로 → `EXAONE-4.0-1.2B`(원본 bf16, transformers)가 사건번호 인용하며 답변 생성. val_query.json #0으로 검증 — 정답 문서가 top-5 1순위로 검색됐고 정확히 인용한 답변 생성 확인(사소한 용어 부정확성 1건 발견, groundedness 평가 때 재확인 예정). **다음: top-5 문서당 chunk 3개 버전 구현 → LLM judge로 두 방식 비교** — [log.md](log.md) 2026-08-25 |
 | 백엔드/배포/운영 | ❌ 시작 전 (v1 코드 있음, 아래 2절 참고) |
 
 **한 줄 요약**: 데이터 준비, 임베딩 모델(KURE-v1) 선정, chunking 전략(chunk_size=300/overlap=100),
 도메인 파인튜닝(Phase A in-batch + Phase B hard negative, base 대비 recall@1 +10.0%p),
-Vector DB 구축까지 **전부 완료.** `chunks_300_overlap100`(13GB)이 파인튜닝 모델 dense 임베딩
-+ Kiwi/tsvector 기반 sparse(BM25) 컬럼을 모두 갖춘 정식 운영 DB로 확정됨(2026-08-24).
+Vector DB 구축까지 **전부 완료.** `chunks_300_overlap100`(13GB)이 파인튜닝 모델 dense 임베딩을
+갖춘 정식 운영 DB로 확정됨(2026-08-24; sparse/BM25용 컬럼은 미채택 결정 후 2026-08-25 제거).
 **sparse+dense hybrid는 진짜 BM25까지 구현해 정식 스윕(sparse_weight 1.0~0.15)까지
 마쳤으나 dense 단독을 못 넘어서 미채택**(코드는 보존, [log.md](log.md) 2026-08-25).
 **reranker는 ColBERT를 디스크 용량 문제로 배제하고 cross-encoder로 진행 — off-the-shelf
 `bge-reranker-v2-m3`는 dense 단독보다 오히려 나빴지만(recall@1 -4.02%p), KURE-v1과 같은
 전략으로 도메인 파인튜닝하니 dense를 확실히 앞지름(recall@1 +6.78%p, mrr@10 +5.39%p).
 **최종 retriever 파이프라인: dense(ef=200) top-30 → 파인튜닝 cross-encoder reranker**로
-확정**(latency 442ms, 이후 필요시 최적화 여지 있음) — 이후 MMR/메타데이터 필터는 순서대로
-진행, 상세는 5절 참고.
+확정**(latency 442ms, 이후 필요시 최적화 여지 있음). **Phase 3(답변 생성) 착수** —
+`server/generate.py`로 top-5 판례 원문 전체 + `EXAONE-4.0-1.2B`(원본, transformers) 기반
+첫 end-to-end 생성 성공([log.md](log.md) 2026-08-25) — 이후 MMR/메타데이터 필터/컨텍스트
+구성 방식 비교는 순서대로 진행, 상세는 5절 참고.
 
 ---
 
@@ -131,16 +133,20 @@ LLM App Engineer 프로젝트로서 합리적인 순서. 아래는 **원안 그�
 
 ### Phase 3 — RAG 답변 품질 개선
 - RAG Generation Pipeline 구축
-  - [ ] Context 구성
-  - [ ] Prompt
-  - [ ] LLM 답변 생성
-  - [ ] 근거/판례 반환
+  - [x] Context 구성 — 1차: top-5 판례 원문 전체(`data/DB_data/{case_no}.json`). chunk+앞뒤
+    버전과 비교 예정(아래 참고), 최종 방식은 미확정
+  - [x] Prompt — 사건번호 인용 지시 포함 기본 프롬프트(`server/generate.py`), 버전관리는 미착수
+  - [x] LLM 답변 생성 — `EXAONE-4.0-1.2B`(원본 bf16, `transformers`)로 첫 end-to-end 성공,
+    val_query.json #0 검증 완료 ([log.md](log.md) 2026-08-25)
+  - [x] 근거/판례 반환 — `[사건번호: ...]` 형식으로 인용, 5개 중 실제 관련된 것만 선택적 인용 확인
   - ➕ **오케스트레이션 방식 결정**: v1은 LangChain 사용. 그대로 갈지, 커스텀 파이프라인으로
-    갈지(디버깅/제어가 쉬움) 결정해두기.
+    갈지(디버깅/제어가 쉬움) 결정해두기. 사건번호 정규식 라우팅 등 "Routing" agentic
+    workflow 패턴 적용 논의됨(미구현) — [log.md](log.md) 2026-08-25
   - ➕ **Prompt 버전 관리**: prompt를 코드에 하드코딩하지 말고 버전 남기기 (A/B 비교 근거 필요)
 - RAG 답변 품질 평가
   - [ ] 답변 정확성
-  - [ ] Groundedness
+  - [ ] Groundedness — 첫 테스트에서 사소한 용어 부정확성 1건 발견("원고가 판시" — 판시는
+    법원의 행위), 정식 평가 시 재확인 필요
   - [ ] Citation 정확성
   - [ ] 답변 불가능한 질문 처리
   - ➕ **평가 방법/도구 결정**: "무엇으로 어떻게 채점할지"가 비어있음 — LLM-as-judge(자체

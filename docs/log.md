@@ -840,3 +840,65 @@ Phase 2 첫 작업으로 KURE-v1 도메인 파인튜닝 설계를 논의하고 1
      오히려 나빠질 가능성이 높다고 예상은 했으나 실측은 아직 안 함 — 작은 val 샘플로
      빠르게 검증 필요.
   2. 로드맵의 나머지 항목(MMR, 메타데이터 필터)으로 진행.
+
+## 2026-08-25 — retriever 마무리 정리(디스크 정리+sparse 컬럼 제거), Phase 3(생성) 착수 및 첫 end-to-end 성공
+
+- **retriever 파이프라인 확정 재확인**: dense(KURE-v1, hard negative 파인튜닝) top-30(ef=200,
+  case_no 중복 제거됨) → reranker(bge-reranker-v2-m3, hard negative 파인튜닝)로 재정렬.
+  Phase 2(검색 정확도 개선) 작업은 여기서 마무리로 판단.
+- **디스크 정리**: 여유 공간이 계속 2GB 안팎으로 빠듯해서 정리 진행.
+  - `data/DB_data/` 안의 macOS AppleDouble 메타데이터 파일(`._*`, 44,700개, 43MB) 삭제 —
+    실제 데이터 아님, 기존 코드에도 이미 필터링 로직이 있었음(`startswith("._")` 제외).
+  - 이미 압축 해제된 `data/DB_data.tar.gz`(121MB, 중복) 삭제.
+  - 안 쓰는 HF 캐시 `nlpai-lab/KURE-v1`(base 모델, 2.29GB) 삭제 — 실제 서빙 모델은
+    로컬 `server/finetune/output/kure-v1-finetuned-hard`라 이 캐시는 base-vs-finetuned
+    비교 실험 때만 필요, 당장 안 씀(필요해지면 재다운로드 가능).
+  - **sparse 관련 DB 컬럼/인덱스 제거**: `chunks_300_overlap100`에서 `chunk_text_kiwi`,
+    `content_tsv` 컬럼과 GIN 인덱스(`content_tsv_gin`) drop. GIN 인덱스(116MB)는 즉시
+    회수됐으나, 컬럼 2개(합쳐서 ~700MB 추정)는 Postgres 특성상 `DROP COLUMN`만으로는
+    물리적 디스크가 안 비워지고 `VACUUM FULL`을 돌려야 하는데, 이건 13GB 테이블을 통째로
+    재작성하는 작업이라 그만큼의 임시 여유 공간이 또 필요함 — 지금은 못 돌리고 나중에
+    여유 생기면 진행. sparse+hybrid는 이미 두 번(ts_rank_cd, 진짜 BM25) 정식 검증 후
+    미채택 결정된 상태라 컬럼 자체는 미련 없이 제거(코드는 `retrievers.py`에 계속 보존).
+  - 결과: 여유 공간 1.7GB → **4.2GB**.
+- **Phase 3(생성) 설계 논의**:
+  - **컨텍스트 구성 방식 결정 대기**: top-5 문서 "전체"를 넘길지, top-5 문서 각각의
+    chunk 3개(매칭 chunk+앞뒤)만 넘길지 — 정확도는 실측 필요, 우선 전체 문서 버전부터
+    구현해서 베이스라인으로 삼기로 함.
+  - **평가 방법**: 두 컨텍스트 방식 비교에는 LLM judge(GPT) 사용 예정. 다만 라우터처럼
+    "정답이 고정된 분류 문제"는 LLM judge보다 라벨셋+정확도가 더 적합하다고 논의(judge는
+    비결정적이라 회귀 테스트엔 부적합) — **판단 대상에 따라 평가 방법을 구분**: 라우터는
+    라벨+정확도, 생성 품질(열린 텍스트)은 LLM judge.
+  - **오케스트레이션/라우팅**: "사건번호로 판례 찾아줘" 같은 정확 일치 질의는 벡터 검색이
+    아니라 정규식으로 사건번호 패턴 감지 후 DB 직접 조회(`WHERE case_no = ...`)로 처리하기로
+    함. 이건 Anthropic이 말하는 "Routing" agentic workflow 패턴에 해당 — v1의 LLM
+    라우터(RAG vs DIRECT)와 같은 계열. 다만 사건번호처럼 형식이 확실한 케이스는 정규식이
+    LLM보다 싸고 100% 결정적이라 정규식 우선, 애매한 케이스(메타데이터 필터 등)만 LLM
+    라우터로 처리하는 하이브리드로 결정.
+  - **라우터용 LLM 선정**: 처음엔 GPT API 대신 소형 로컬 모델(0.6B급)을 검토하다가,
+    **LG `EXAONE-4.0-1.2B`**로 확정. 이유: 2025-07 공개된 on-device 모델로 한국어 지원이
+    강하고, 학습 단계에 **agentic tool-use가 포함**돼있어 라우팅/tool-calling 용도에
+    적합. GGUF Q8_0(공식, 1.36GB) 양자화 버전도 있었지만, GGUF/llama.cpp는 `transformers`
+    생태계와 완전히 분리된 별도 스택이고 **파인튜닝이 안 되는 추론 전용 포맷**이라, 디스크
+    정리로 여유(4.2GB)가 생긴 뒤엔 **원본(bf16, ~2.4GB, `transformers` 그대로 사용)으로
+    확정** — 지금까지 dense/reranker와 같은 생태계 유지 + 나중에 파인튜닝 여지도 남김.
+    라이선스는 "연구/학술 목적" — 포트폴리오 용도엔 문제없으나 상업적 사용 시 재확인 필요.
+- **`server/generate.py` 신설 — RAG 생성 파이프라인 최소 버전, 첫 end-to-end 성공**:
+  검색(`CrossEncoderReranker` 재사용, top-30→top-5) → top-5 판례 **원문 전체**를
+  `data/DB_data/{case_no}.json`에서 읽어와 컨텍스트 구성(사건번호 인용 지시 포함 프롬프트)
+  → `EXAONE-4.0-1.2B`로 답변 생성.
+  - **버그 수정**: `tokenizer.apply_chat_template(..., return_tensors="pt")`가 설치된
+    transformers(5.15.0)에서 raw tensor가 아니라 dict형(BatchEncoding)을 반환해서
+    `model.generate()`에서 `.shape` 접근 실패 — `return_dict=False` 명시로 해결.
+    `torch_dtype`→`dtype` deprecation도 같이 정리.
+  - **val_query.json #0으로 첫 테스트 성공**: 정답 문서(`2000가합4547`)가 top-5 중 1순위로
+    정확히 검색됨 → EXAONE이 `[사건번호: 2000가합4547]` 형식으로 정확히 인용하며, 제공된
+    5개 판례 중 실제 관련 있는 1개만 선택적으로 인용(나머지 4개는 억지로 안 끌어씀)하는
+    답변을 생성. 질문의 부정 의문문 구조도 정확히 파악.
+  - **⚠️ 발견된 사소한 이슈**: 답변 중 "원고는... 판시하였습니다"라는 표현 — "판시"는
+    법원의 행위지 원고(당사자)가 하는 게 아님. 실제 원문과 다른 표현인지 확인 필요 —
+    나중에 groundedness 평가(LLM judge) 항목에서 이런 미묘한 부정확성이 잡히는지 볼 것.
+- **다음**: (1) chunk+앞뒤 버전 구현해서 문서 전체 버전과 비교, (2) LLM judge로 두 버전
+  품질 비교(groundedness/citation 정확성 rubric), (3) 사건번호 정규식 라우팅 구현,
+  (4) `VACUUM FULL`은 여유 공간 넉넉해질 때 한 번 실행해서 sparse 컬럼 삭제분(~700MB)
+  실제 회수.
