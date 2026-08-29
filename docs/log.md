@@ -902,3 +902,37 @@ Phase 2 첫 작업으로 KURE-v1 도메인 파인튜닝 설계를 논의하고 1
   품질 비교(groundedness/citation 정확성 rubric), (3) 사건번호 정규식 라우팅 구현,
   (4) `VACUUM FULL`은 여유 공간 넉넉해질 때 한 번 실행해서 sparse 컬럼 삭제분(~700MB)
   실제 회수.
+
+## 2026-08-25 — chunk 컨텍스트 버전 구현 + GPT-5-mini judge 비교 파이프라인 완성, 첫 성공
+
+- **GPT API 비용 산정**: 판례 500개 샘플로 문서 길이 실측(평균 3,830자, 중앙값 2,486자,
+  90퍼센타일 7,268자) → top-5 기준 평균 약 19,150자 ≈ 11,300토큰(한글 1.7자/토큰 근사) +
+  judge rubric/답변 등 포함 입력 총 12,500토큰 안팎으로 추정. GPT-4o 기준으로도 1건당
+  약 $0.035(46원), GPT-5-mini는 $0.0039(5원) 수준 — 예산 문제 없다고 판단, **judge
+  모델은 GPT-5-mini로 확정**.
+- **`generate.py` 리팩터링**: 모델 로딩/검색/컨텍스트 구성/생성을 함수로 분리(`load_models`,
+  `retrieve_top_k`, `build_context_full`, `build_context_chunks`, `generate_answer`) —
+  `judge_compare.py`가 모델을 한 번만 로드하고 두 컨텍스트 방식을 재사용할 수 있게 함.
+  `--context-mode {full,chunks}` CLI 옵션 추가.
+  - **`build_context_chunks` 구현**: `CrossEncoderReranker`는 case_no 랭킹만 반환하고
+    어떤 chunk가 매칭됐는지 정보를 버리므로, 문서별로 `WHERE case_no = %s ORDER BY dist
+    LIMIT 1`로 최근접 chunk_index를 다시 찾은 뒤 앞뒤 1개씩(`CHUNK_WINDOW=1`, 문서당 총
+    3개) 붙여서 컨텍스트 구성. 코퍼스 전체가 아니라 case_no 하나로 좁혀서 찾는 거라
+    비용 작음.
+- **`server/judge_compare.py` 신설**: 같은 쿼리로 full/chunks 두 컨텍스트 방식 답변을 각각
+  생성 → GPT-5-mini에 **원문 레퍼런스(top-5 판례 전체) + 두 답변**을 같이 줘서 정확성/
+  groundedness/인용정확성 비교, JSON으로 판정 받음. **위치 편향 방지**: A/B에 어느 쪽
+  답변이 들어갈지 쿼리마다 무작위로 섞고, 결과 해석 시에만 라벨을 되돌림. **길이 편향
+  방지**: "길고 자세하다는 이유만으로 우세 판정하지 말 것"을 judge 프롬프트에 명시.
+- **val_query.json #0으로 첫 end-to-end 성공**:
+  - full/chunks 두 답변 다 사건번호(`2000가합4547`) 정확히 인용, 핵심 결론 일치
+  - **judge가 이전에 발견했던 미묘한 오류를 실제로 잡아냄** — full 버전의 "원고가
+    판시하였다"는 주체 오류(판시는 법원이 하는 것)를 judge가 스스로 지적하며 A(full)에
+    감점 요인으로 명시. groundedness 평가가 실제로 이런 세밀한 부정확성까지 잡아낸다는
+    걸 실측으로 확인.
+  - 판정: 정확성/종합 우세 = chunks 버전, groundedness/인용정확성은 무승부. 1건뿐이라
+    확정적이진 않지만 **chunk 버전이 문서 전체 버전보다 밀리지 않는다**(오히려 이번엔
+    우세)는 신호 — "문서 전체를 안 넘겨도 될 수 있다"는 가설에 부합하는 첫 데이터 포인트.
+- **다음**: val_query.json에서 50~100개 정도로 늘려서 정식 비교(현재는 1건짜리 스모크
+  테스트), 사건번호 정규식 라우팅 구현, 답변 불가능 질문 처리(관련성 낮으면 reranker
+  점수로 거르기) 구현.
