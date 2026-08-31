@@ -41,6 +41,8 @@ ios/
 /server/cache_embeddings/
 /server/finetune/output/
 /server/finetune/*.jsonl
+/server/judge_results*.jsonl
+/server/eval/threshold_calibration.jsonl
 
 # ---- 기타 ----
 .env

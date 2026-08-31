@@ -295,15 +295,37 @@ class CrossEncoderReranker:
     def _pg_vector_literal(vec):
         return "[" + ",".join(f"{x:.6f}" for x in vec) + "]"
 
+    def _rerank_one(self, cur, query, vec):
+        """쿼리 하나에 대해 1단계(dense pool)+2단계(cross-encoder 재점수)를 실행하고
+        (case_no 정렬 리스트, 정렬된 순서의 cross-encoder 점수 배열)를 반환. rows가
+        비어있으면 (빈 리스트, 빈 배열)."""
+        pool_k = self.top_n * 10  # case_no dedupe 후에도 top_n개가 남으려면 넉넉해야 함
+        lit = self._pg_vector_literal(vec)
+        cur.execute(
+            f"WITH nearest AS ("
+            f"    SELECT case_no, chunk_text, embedding <=> %s AS dist FROM {self.table} "
+            f"    ORDER BY embedding <=> %s LIMIT {pool_k}"
+            f") "
+            f"SELECT DISTINCT ON (case_no) case_no, chunk_text, dist FROM nearest "
+            f"ORDER BY case_no, dist",
+            (lit, lit),
+        )
+        rows = sorted(cur.fetchall(), key=lambda r: r[2])[:self.top_n]
+        if not rows:
+            return [], np.array([])
+
+        pairs = [(query, r[1]) for r in rows]
+        scores = np.asarray(self.cross_encoder.predict(
+            pairs, batch_size=self.rerank_batch_size, show_progress_bar=False))
+        order = np.argsort(-scores)
+        ranked = [rows[i][0] for i in order]
+        return ranked, scores[order]
+
     def retrieve_batch(self, queries, max_k):
         query_embs = l2norm(self.dense_model.encode(
             queries, batch_size=self.query_batch_size, show_progress_bar=False,
             convert_to_numpy=True, normalize_embeddings=True,
         ).astype(np.float32))
-
-        # case_no dedupe 후에도 top_n개가 남으려면 넉넉한 pool에서 시작해야 함(PgvectorRetriever
-        # 주석 참고) — top_n의 10배 정도면 충분히 여유 있음
-        pool_k = self.top_n * 10
 
         results = []
         with self.conn.cursor() as cur:
@@ -311,25 +333,25 @@ class CrossEncoderReranker:
             # top_n번씩 돌려야 해서 느린 경우엔 갱신 간격이 너무 뜸함 — 쿼리 단위로 한 번 더
             # 감쌈(leave=False라 배치 진행률 바로 아래 한 줄만 쓰고 사라짐, 여러 줄 안 쌓임)
             for query, vec in tqdm(list(zip(queries, query_embs)), desc="rerank", leave=False, ncols=80):
-                lit = self._pg_vector_literal(vec)
-                cur.execute(
-                    f"WITH nearest AS ("
-                    f"    SELECT case_no, chunk_text, embedding <=> %s AS dist FROM {self.table} "
-                    f"    ORDER BY embedding <=> %s LIMIT {pool_k}"
-                    f") "
-                    f"SELECT DISTINCT ON (case_no) case_no, chunk_text, dist FROM nearest "
-                    f"ORDER BY case_no, dist",
-                    (lit, lit),
-                )
-                rows = sorted(cur.fetchall(), key=lambda r: r[2])[:self.top_n]
-                if not rows:
-                    results.append([])
-                    continue
-
-                pairs = [(query, r[1]) for r in rows]
-                scores = self.cross_encoder.predict(
-                    pairs, batch_size=self.rerank_batch_size, show_progress_bar=False)
-                order = np.argsort(-np.asarray(scores))
-                ranked = [rows[i][0] for i in order][:max_k]
-                results.append(ranked)
+                ranked, _ = self._rerank_one(cur, query, vec)
+                results.append(ranked[:max_k])
         return results
+
+    def retrieve_batch_with_scores(self, queries, max_k):
+        """retrieve_batch와 동일하지만 각 쿼리의 1등 cross-encoder 점수(top1_score)도 같이
+        반환 — "관련 판례 없음" 판단용 threshold를 실측 근거로 정하려고 추가함(문서에 없는
+        질문에 답 안 하기 기능, docs/log.md 참고). 점수는 클수록 확신도가 높다는 상대적
+        신호일 뿐 절대적 확률은 아니라서, 실제로 어디서 끊을지는 recall@k 성공/실패 케이스의
+        점수 분포를 직접 비교해서 정해야 함."""
+        query_embs = l2norm(self.dense_model.encode(
+            queries, batch_size=self.query_batch_size, show_progress_bar=False,
+            convert_to_numpy=True, normalize_embeddings=True,
+        ).astype(np.float32))
+
+        results, top1_scores = [], []
+        with self.conn.cursor() as cur:
+            for query, vec in tqdm(list(zip(queries, query_embs)), desc="rerank+score", leave=False, ncols=80):
+                ranked, scores = self._rerank_one(cur, query, vec)
+                results.append(ranked[:max_k])
+                top1_scores.append(float(scores[0]) if len(scores) else float("-inf"))
+        return results, top1_scores

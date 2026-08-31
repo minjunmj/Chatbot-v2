@@ -7,7 +7,7 @@
 > "1. 지금 당장 상태"와 "5. 다음 계획"을 최신으로 고쳐쓸 것. 이 두 가지를 안 하면 다음
 > 세션이 다시 헤맨다.
 
-최종 갱신: 2026-08-25
+최종 갱신: 2026-08-31
 
 ---
 
@@ -44,7 +44,7 @@
 | Reranker 방식 결정 | ✅ **완료 — ColBERT 배제, cross-encoder로 확정.** ColBERT는 chunk당 토큰 수만큼 벡터를 저장해야 해서 어림 60GB대 필요(압축해도 5~10GB) — 이 인스턴스 디스크(32GB 고정, 여유 3.9GB)로는 불가능. cross-encoder는 코퍼스를 미리 인코딩/저장하지 않는 구조라 추가 디스크 불필요(모델 가중치만 필요) — [log.md](log.md) 2026-08-25 |
 | Reranker(off-the-shelf) 평가 | ✅ 완료 — `CrossEncoderReranker`(`server/eval/retrievers.py`) 구현, `bge-reranker-v2-m3`로 정식(7,280개) 평가. **예상 밖으로 dense 단독보다 전 지표 나쁨**(recall@1 0.6710→0.6308, mrr@10 0.7645→0.7305, latency 11.66ms→421ms) — 범용 cross-encoder가 도메인 파인튜닝된 dense의 1등 픽을 오히려 밀어냄. sparse+hybrid 때와 같은 "도메인 미세조정 안 된 범용 방법이 강한 dense를 못 이김" 패턴 — [log.md](log.md) 2026-08-25 |
 | Reranker 도메인 파인튜닝 | ✅ **완료 — dense 단독을 전 지표에서 넘어섬.** KURE-v1과 같은 전략(base 위에 이어서 학습)을 cross-encoder에 적용(`prepare_reranker_data.py`+`train_reranker.py`, train_query.json 41,319개). 정식(7,280개) 평가(top_n=30): recall@1 0.6768→**0.7446**(dense 단독 대비 +6.78%p), recall@3 **0.8971**, mrr@10 0.7707→**0.8246**(+5.39%p). off-the-shelf가 dense보다 못했던 것(-4.02%p)과 정반대 — dense 파인튜닝(+10.0%p) 때와 동일한 "범용 실패, 도메인 파인튜닝 성공" 패턴 재현. **최종 retriever 파이프라인을 "dense(ef=200) top-30 → 파인튜닝 reranker"로 확정.** latency 442ms(dense 단독 대비 22배)는 UX 응답시간 기준(1초 미만)에 들어오고 top_n=10 축소 시 recall 손해가 더 커 보여 **top_n=30 유지로 잠정 결론** — [log.md](log.md) 2026-08-25 |
-| RAG 답변 생성 파이프라인 | 🔄 **진행 중 — full/chunks 두 컨텍스트 방식 + GPT-5-mini judge 비교까지 첫 성공.** `server/generate.py`(dense+reranker top-5 검색 → 컨텍스트 구성 `--context-mode full\|chunks` → `EXAONE-4.0-1.2B` 생성, 재사용 가능한 함수로 리팩터링) + `server/judge_compare.py`(같은 쿼리로 두 방식 답변 생성 → GPT-5-mini가 원문 레퍼런스 대조해 정확성/groundedness/인용정확성 비교, 위치·길이 편향 방지 프롬프트). val_query.json #0 테스트: judge가 full 버전의 "원고가 판시" 같은 미묘한 오류를 실제로 잡아냄, chunks 버전이 밀리지 않음(오히려 이번엔 우세) — 1건뿐이라 확정 아님. **다음: 50~100개로 정식 비교** — [log.md](log.md) 2026-08-25 |
+| RAG 답변 생성 파이프라인 | ✅ **컨텍스트 구성 방식 확정 — chunks 채택.** 사건유형 22개 전체 커버하는 171건 테스트셋(`build_typed_test_set.py`)으로 `run_judge_compare.py` 정식 비교 실행. **chunks(매칭 chunk+앞뒤)가 정확성 65.0%/groundedness 65.3%/인용정확성 72.9%/종합 64.9% 승률로 full(문서 전체) 대비 전 지표 우세**(무승부 제외, p<0.001). 원인: `EXAONE-4.0-1.2B`(1.2B 소형 모델)가 방대한 전체 문서엔 가끔 완전히 답을 못 만듦(170건 중 2건, chunks는 0건). **추가로 full 방식엔 구조적 결함 발견**: 코퍼스에 극단적으로 긴 문서(23만자)가 top-5에 걸리면 컨텍스트가 EXAONE 최대 컨텍스트(65,536토큰)를 넘어서 CUDA OOM 발생 — chunks는 문서 길이 무관하게 크기 고정이라 이 문제 자체가 없음. 예외: 세무/특허 유형은 다수 판례 간 수치 혼동이 잦아 full이 오히려 우세 — 추후 유형별 라우팅 고려 가능(미구현). **최종 파이프라인: dense+reranker top-5 → chunks 컨텍스트 → EXAONE 생성**으로 확정 — [log.md](log.md) 2026-08-31 |
 | 백엔드/배포/운영 | ❌ 시작 전 (v1 코드 있음, 아래 2절 참고) |
 
 **한 줄 요약**: 데이터 준비, 임베딩 모델(KURE-v1) 선정, chunking 전략(chunk_size=300/overlap=100),
@@ -57,11 +57,12 @@ Vector DB 구축까지 **전부 완료.** `chunks_300_overlap100`(13GB)이 파�
 `bge-reranker-v2-m3`는 dense 단독보다 오히려 나빴지만(recall@1 -4.02%p), KURE-v1과 같은
 전략으로 도메인 파인튜닝하니 dense를 확실히 앞지름(recall@1 +6.78%p, mrr@10 +5.39%p).
 **최종 retriever 파이프라인: dense(ef=200) top-30 → 파인튜닝 cross-encoder reranker**로
-확정**(latency 442ms, 이후 필요시 최적화 여지 있음). **Phase 3(답변 생성) 진행 중** —
-`server/generate.py`(dense+reranker top-5 검색 + full/chunks 컨텍스트 + `EXAONE-4.0-1.2B`
-생성) + `server/judge_compare.py`(GPT-5-mini judge로 두 컨텍스트 방식 비교) 구현 완료,
-1건 end-to-end 성공([log.md](log.md) 2026-08-25) — 이후 MMR/메타데이터 필터/정식 규모
-컨텍스트 방식 비교는 순서대로 진행, 상세는 5절 참고.
+확정**(latency 442ms, 이후 필요시 최적화 여지 있음). **Phase 3(답변 생성) 컨텍스트 구성
+방식 확정** — `server/generate.py`(dense+reranker top-5 검색 + chunks 컨텍스트 +
+`EXAONE-4.0-1.2B` 생성) + `server/judge_compare.py`/`run_judge_compare.py`(GPT-5-mini
+judge)로 171건 정식 비교, **chunks가 full 대비 전 지표 우세 + OOM 위험도 회피**해서
+최종 채택([log.md](log.md) 2026-08-31) — 이후 MMR/메타데이터 필터/사건번호 라우팅은
+순서대로 진행, 상세는 5절 참고.
 
 ---
 
@@ -134,9 +135,9 @@ LLM App Engineer 프로젝트로서 합리적인 순서. 아래는 **원안 그�
 
 ### Phase 3 — RAG 답변 품질 개선
 - RAG Generation Pipeline 구축
-  - [x] Context 구성 — full(판례 원문 전체)/chunks(매칭 chunk+앞뒤, `CHUNK_WINDOW=1`)
-    두 방식 다 구현(`generate.py`), GPT-5-mini judge로 비교 중 — 최종 방식은 미확정
-    (1건 테스트에서 chunks가 밀리지 않음, [log.md](log.md) 2026-08-25)
+  - [x] Context 구성 — **chunks(매칭 chunk+앞뒤, `CHUNK_WINDOW=1`)로 최종 확정.** 171건
+    정식 비교에서 full(판례 원문 전체) 대비 전 지표 우세 + 극단적으로 긴 문서로 인한
+    CUDA OOM도 회피 — [log.md](log.md) 2026-08-31
   - [x] Prompt — 사건번호 인용 지시 포함 기본 프롬프트(`server/generate.py`), 버전관리는 미착수
   - [x] LLM 답변 생성 — `EXAONE-4.0-1.2B`(원본 bf16, `transformers`)로 첫 end-to-end 성공,
     val_query.json #0 검증 완료 ([log.md](log.md) 2026-08-25)
@@ -151,11 +152,17 @@ LLM App Engineer 프로젝트로서 합리적인 순서. 아래는 **원안 그�
     groundedness/인용정확성 3축 JSON 판정 + 위치·길이 편향 방지 프롬프트까지 구현+검증.
     라우터 같은 이산 분류는 LLM judge 대신 라벨셋+정확도로 별도 평가하기로 구분함
     ([log.md](log.md) 2026-08-25)
-  - [x] 답변 정확성/Groundedness/Citation 정확성 — val_query.json #0 1건으로 파이프라인
-    동작 검증(judge가 "원고가 판시"라는 미묘한 주체 오류를 실제로 잡아냄). **다음: 50~100건
-    규모로 정식 실행**
-  - [ ] 답변 불가능한 질문 처리 — reranker cross-encoder 점수를 신뢰도 신호로 쓰는 방안
-    논의만 됨, 미구현
+  - [x] 답변 정확성/Groundedness/Citation 정확성 — **171건 정식 실행 완료**(사건유형 22개
+    커버, `build_typed_test_set.py`+`run_judge_compare.py`). chunks가 정확성 65.0%/
+    groundedness 65.3%/인용정확성 72.9%/종합 64.9% 승률로 우세(p<0.001). 세무/특허
+    유형은 예외적으로 full이 우세(다수 판례 간 수치 혼동) — 유형별 라우팅은 미구현
+    ([log.md](log.md) 2026-08-31)
+  - [ ] 답변 불가능한 질문 처리 — **reranker 점수 threshold 단독으론 불충분하다고 실측
+    확인**(`calibrate_threshold.py`, val_query.json 7,280개: miss 중앙값 0.808이 hit
+    25퍼센타일 0.806과 거의 같을 정도로 분포가 겹침 — "확신 있게 틀림"인 miss가 대부분).
+    아주 낮은 threshold(0.1~0.15)는 hit 손실 거의 없이 miss 4~6% 저비용으로 걸러내는
+    용도로는 쓸만함. **다음: 낮은 threshold로 명백히 무관한 질문만 1차 필터 + 애매한
+    영역은 LLM 판단에 위임하는 하이브리드로 구현**(미착수) — [log.md](log.md) 2026-08-31
   - ➕ **평가 방법/도구 결정**: "무엇으로 어떻게 채점할지"가 비어있음 — LLM-as-judge(자체
     rubric) vs RAGAS/DeepEval 같은 기존 프레임워크 중 택1 필요. 사람이 매번 눈으로 보는 건
     확장 안 됨.
