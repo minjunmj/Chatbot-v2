@@ -43,6 +43,8 @@ ios/
 /server/finetune/*.jsonl
 /server/judge_results*.jsonl
 /server/eval/threshold_calibration.jsonl
+/server/miss_rejection_results.jsonl
+/server/answer_quality_results.jsonl
 
 # ---- 기타 ----
 .env
