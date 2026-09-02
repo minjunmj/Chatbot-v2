@@ -25,8 +25,8 @@ from tqdm import tqdm
 
 from generate import load_models, retrieve_top_k, build_context_chunks, generate_answer
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # server/
-CALIB_PATH = os.path.join(BASE_DIR, "eval", "threshold_calibration.jsonl")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # server/research/
+CALIB_PATH = os.path.join(BASE_DIR, "..", "eval", "threshold_calibration.jsonl")
 OUT_PATH = os.path.join(BASE_DIR, "miss_rejection_results.jsonl")
 
 # generate.py의 build_prompt() 지시("제공된 판례로 답할 수 없으면 그렇게 솔직히 답하세요")를

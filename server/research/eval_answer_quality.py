@@ -34,8 +34,8 @@ from tqdm import tqdm
 
 from generate import load_models, retrieve_top_k, load_full_doc, build_context_chunks, generate_answer
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # server/
-CALIB_PATH = os.path.join(BASE_DIR, "eval", "threshold_calibration.jsonl")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # server/research/
+CALIB_PATH = os.path.join(BASE_DIR, "..", "eval", "threshold_calibration.jsonl")
 MISS_REJECTION_PATH = os.path.join(BASE_DIR, "miss_rejection_results.jsonl")
 OUT_PATH = os.path.join(BASE_DIR, "answer_quality_results.jsonl")
 

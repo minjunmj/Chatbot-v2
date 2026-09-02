@@ -41,10 +41,12 @@ ios/
 /server/cache_embeddings/
 /server/finetune/output/
 /server/finetune/*.jsonl
-/server/judge_results*.jsonl
+/server/research/judge_results*.jsonl
 /server/eval/threshold_calibration.jsonl
-/server/miss_rejection_results.jsonl
-/server/answer_quality_results.jsonl
+/server/research/miss_rejection_results.jsonl
+/server/research/answer_quality_results.jsonl
+/server/research/answer_quality_results_v2.jsonl
+/server/research/prompt_v2_results.jsonl
 
 # ---- 기타 ----
 .env

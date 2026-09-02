@@ -1,6 +1,26 @@
+# --- 핵심 파이프라인 (dense+reranker 임베딩, 생성) ---
 torch>=2.4.0
 transformers>=4.51.3
 sentence-transformers>=3.3.1
 accelerate>=0.34.0
 numpy>=1.26.0
 tqdm>=4.66.0
+psycopg2-binary>=2.9.12
+
+# --- sparse/BM25 (retrievers.py에 코드 보존, 최종 미채택 — SparseRetriever/HybridRetriever용) ---
+kiwipiepy>=0.23.2
+
+# --- 파인튜닝 (server/finetune) ---
+datasets>=5.0.1
+
+# --- 서비스 (server/service, FastAPI) ---
+fastapi>=0.141.1
+uvicorn>=0.52.4
+pydantic>=2.13.5
+
+# --- 연구/평가 스크립트 (server/research, GPT judge) ---
+openai>=3.6.0
+
+# --- 참고용 전용 (server/bge_hybrid.py — 실제 파이프라인에서는 안 씀) ---
+FlagEmbedding>=1.4.0
+scipy>=1.18.0

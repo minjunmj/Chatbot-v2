@@ -7,7 +7,13 @@
 > "1. 지금 당장 상태"와 "5. 다음 계획"을 최신으로 고쳐쓸 것. 이 두 가지를 안 하면 다음
 > 세션이 다시 헤맨다.
 
-최종 갱신: 2026-09-01
+최종 갱신: 2026-09-02 (스코프 최종 확정)
+
+> **프로젝트 스코프 마감**: 2026-09-02에 남아있던 미결정 항목들을 사용자가 최종
+> 확정함(reasoning mode 미채택, 세무/특허 유형 분리 안 함, 사건번호 라우팅/MMR/메타데이터
+> 필터는 future work로 유보, reranker negative ablation 가설 폐기, Phase 4 백엔드
+> 고도화는 스코프 아웃). 상세 근거는 [log.md](log.md) 2026-09-02 (계속3) 항목,
+> 흐름 요약은 [DECISIONS.md](DECISIONS.md) 참고.
 
 ---
 
@@ -44,8 +50,10 @@
 | Reranker 방식 결정 | ✅ **완료 — ColBERT 배제, cross-encoder로 확정.** ColBERT는 chunk당 토큰 수만큼 벡터를 저장해야 해서 어림 60GB대 필요(압축해도 5~10GB) — 이 인스턴스 디스크(32GB 고정, 여유 3.9GB)로는 불가능. cross-encoder는 코퍼스를 미리 인코딩/저장하지 않는 구조라 추가 디스크 불필요(모델 가중치만 필요) — [log.md](log.md) 2026-08-25 |
 | Reranker(off-the-shelf) 평가 | ✅ 완료 — `CrossEncoderReranker`(`server/eval/retrievers.py`) 구현, `bge-reranker-v2-m3`로 정식(7,280개) 평가. **예상 밖으로 dense 단독보다 전 지표 나쁨**(recall@1 0.6710→0.6308, mrr@10 0.7645→0.7305, latency 11.66ms→421ms) — 범용 cross-encoder가 도메인 파인튜닝된 dense의 1등 픽을 오히려 밀어냄. sparse+hybrid 때와 같은 "도메인 미세조정 안 된 범용 방법이 강한 dense를 못 이김" 패턴 — [log.md](log.md) 2026-08-25 |
 | Reranker 도메인 파인튜닝 | ✅ **완료 — dense 단독을 전 지표에서 넘어섬.** KURE-v1과 같은 전략(base 위에 이어서 학습)을 cross-encoder에 적용(`prepare_reranker_data.py`+`train_reranker.py`, train_query.json 41,319개). 정식(7,280개) 평가(top_n=30): recall@1 0.6768→**0.7446**(dense 단독 대비 +6.78%p), recall@3 **0.8971**, mrr@10 0.7707→**0.8246**(+5.39%p). off-the-shelf가 dense보다 못했던 것(-4.02%p)과 정반대 — dense 파인튜닝(+10.0%p) 때와 동일한 "범용 실패, 도메인 파인튜닝 성공" 패턴 재현. **최종 retriever 파이프라인을 "dense(ef=200) top-30 → 파인튜닝 reranker"로 확정.** latency 442ms(dense 단독 대비 22배)는 UX 응답시간 기준(1초 미만)에 들어오고 top_n=10 축소 시 recall 손해가 더 커 보여 **top_n=30 유지로 잠정 결론** — [log.md](log.md) 2026-08-25 |
-| RAG 답변 생성 파이프라인 | ✅ **컨텍스트 구성 방식 확정 — chunks 채택.** 사건유형 22개 전체 커버하는 171건 테스트셋(`build_typed_test_set.py`)으로 `run_judge_compare.py` 정식 비교 실행. **chunks(매칭 chunk+앞뒤)가 정확성 65.0%/groundedness 65.3%/인용정확성 72.9%/종합 64.9% 승률로 full(문서 전체) 대비 전 지표 우세**(무승부 제외, p<0.001). 원인: `EXAONE-4.0-1.2B`(1.2B 소형 모델)가 방대한 전체 문서엔 가끔 완전히 답을 못 만듦(170건 중 2건, chunks는 0건). **추가로 full 방식엔 구조적 결함 발견**: 코퍼스에 극단적으로 긴 문서(23만자)가 top-5에 걸리면 컨텍스트가 EXAONE 최대 컨텍스트(65,536토큰)를 넘어서 CUDA OOM 발생 — chunks는 문서 길이 무관하게 크기 고정이라 이 문제 자체가 없음. 예외: 세무/특허 유형은 다수 판례 간 수치 혼동이 잦아 full이 오히려 우세 — 추후 유형별 라우팅 고려 가능(미구현). **최종 파이프라인: dense+reranker top-5 → chunks 컨텍스트 → EXAONE 생성**으로 확정. **답변 불가능 질문 처리는 조사 후 보류** — GPT judge로 라벨 대신 실제 top-5 내용 기준 관련성을 검증한 결과, 미거절 miss의 100%가 실제로는 관련 문서 있었고(recall@5가 실유용성 과소평가) 거절한 것의 90%는 거절하면 안 됐음(LLM 자체 판단 신뢰 부족) — threshold=0.2로 명백히 무관한 질문만 거르고 나머지는 항상 답변 시도하는 쪽으로 결론 — [log.md](log.md) 2026-08-31, 2026-09-01 |
-| 백엔드/배포/운영 | ❌ 시작 전 (v1 코드 있음, 아래 2절 참고) |
+| RAG 답변 생성 파이프라인 | ✅ **컨텍스트 구성 방식 확정 — chunks 채택 (모든 사건유형에 동일 적용, 세무/특허 유형 분리 안 함으로 최종 확정).** 사건유형 22개 전체 커버하는 171건 테스트셋(`build_typed_test_set.py`)으로 `run_judge_compare.py` 정식 비교 실행. **chunks(매칭 chunk+앞뒤)가 정확성 65.0%/groundedness 65.3%/인용정확성 72.9%/종합 64.9% 승률로 full(문서 전체) 대비 전 지표 우세**(무승부 제외, p<0.001). 원인: `EXAONE-4.0-1.2B`(1.2B 소형 모델)가 방대한 전체 문서엔 가끔 완전히 답을 못 만듦(170건 중 2건, chunks는 0건). **추가로 full 방식엔 구조적 결함 발견**: 코퍼스에 극단적으로 긴 문서(23만자)가 top-5에 걸리면 컨텍스트가 EXAONE 최대 컨텍스트(65,536토큰)를 넘어서 CUDA OOM 발생 — chunks는 문서 길이 무관하게 크기 고정이라 이 문제 자체가 없음. 예외: 세무/특허 유형은 다수 판례 간 수치 혼동이 잦아 full이 오히려 우세했으나, **유형별 분기는 하지
+않고 모든 유형에 chunks를 동일 적용하기로 최종 확정**(2026-09-02). **최종 파이프라인: dense+reranker top-5 → chunks 컨텍스트 → EXAONE 생성**으로 확정. **답변 불가능 질문 처리는 조사 후 보류** — GPT judge로 라벨 대신 실제 top-5 내용 기준 관련성을 검증한 결과, 미거절 miss의 100%가 실제로는 관련 문서 있었고(recall@5가 실유용성 과소평가) 거절한 것의 90%는 거절하면 안 됐음(LLM 자체 판단 신뢰 부족) — threshold=0.2로 명백히 무관한 질문만 거르고 나머지는 항상 답변 시도하는 쪽으로 결론. **rubric 개선(grounded/resolves_question 분리) 후 재평가 — 실사용 정답률은 73~78%가 정직한 수치**(hit 78.0%, miss-미거절 관련있던것중 72.9% — 기존 뭉뚱그린 answer_correct(87%/77.6%)보다 낮음. hit은 할루시네이션이 주 병목(grounded 80% vs resolves 89%)) — [log.md](log.md) 2026-08-31, 2026-09-01. **Reasoning mode는 속도(7~7.5배 느림)만 측정하고 정확도 검증 없이 최종 미채택으로 확정**(2026-09-02) — 일반 모드 유지. |
+| 채팅 기능 (router+멀티턴) | ✅ **완료.** `/chat` 엔드포인트 — EXAONE 자신이 매 턴 SEARCH(새 검색 필요)/DIRECT(일반 대화·재질문)를 분류하는 router + 클라이언트가 전체 히스토리를 재전송하는 stateless 멀티턴. 실사용 중 발견한 버그 3건 수정 완료: ① 라우터가 실제 법률 질문을 DIRECT로 오분류 → few-shot+"애매하면 SEARCH" 편향 추가, ② 한글 IME 조합 중 Enter로 답변 중복 전송 → `isComposing` 가드 추가, ③ 무관한 잡담에도 검색이 걸려 reranker 확신도가 극히 낮은데 모델이 가짜 판례번호로 답변 조작 → 기존에 실측해둔 threshold(0.2)를 서비스 코드에 실제로 연결해 안전장치로 사용. 채팅 UI에 "새 대화"(히스토리 초기화) 버튼도 추가 — [log.md](log.md) 2026-09-02 (계속3) |
+| 백엔드/배포/운영 | ✅ **완료, 스코프 여기서 마감(사용자 최종 결정, 2026-09-02).** `server/service/api.py`(FastAPI, `/health`+`/ask`+`/chat`+채팅 데모 페이지) + `pipeline.py`(최종 채택 구성만 남긴 RAG 파이프라인), 모델은 기동 시 1회 로드. Vast.ai 인스턴스(AWS 아님 — 비용/편의상 선택)에 supervisor 서비스(`lexchatbot`)로 등록해 Caddy 인증 엣지 뒤로 외부 노출, 토큰 인증 확인 완료. `server/`를 `service/`(배포 코드)/`research/`(실험 스크립트)/`eval/`(공유 라이브러리)로 재구성. **세션 저장, 입력 검증/에러 처리, 로깅/모니터링, rate limiting, 스트리밍, Docker화, AWS 배포는 의도적으로 스코프 아웃** — 지금 상태를 포트폴리오 프로젝트의 최종 완성 지점으로 간주. 구조는 [STRUCTURE.md](STRUCTURE.md), 근거는 [log.md](log.md) 2026-09-02 참고 |
 
 **한 줄 요약**: 데이터 준비, 임베딩 모델(KURE-v1) 선정, chunking 전략(chunk_size=300/overlap=100),
 도메인 파인튜닝(Phase A in-batch + Phase B hard negative, base 대비 recall@1 +10.0%p),
@@ -144,7 +152,7 @@ LLM App Engineer 프로젝트로서 합리적인 순서. 아래는 **원안 그�
   - [x] 근거/판례 반환 — `[사건번호: ...]` 형식으로 인용, 5개 중 실제 관련된 것만 선택적 인용 확인
   - ➕ **오케스트레이션 방식 결정**: v1은 LangChain 사용. 그대로 갈지, 커스텀 파이프라인으로
     갈지(디버깅/제어가 쉬움) 결정해두기. 사건번호 정규식 라우팅 등 "Routing" agentic
-    workflow 패턴 적용 논의됨(미구현) — [log.md](log.md) 2026-08-25
+    workflow 패턴 적용 논의됐으나 **future work로 유보(2026-09-02)** — [log.md](log.md) 2026-08-25
   - ➕ **Prompt 버전 관리**: prompt를 코드에 하드코딩하지 말고 버전 남기기 (A/B 비교 근거 필요)
 - RAG 답변 품질 평가
   - [x] 평가 방법/도구 결정 — **GPT-5-mini를 LLM judge로 확정**(비용 실측: 1건당
@@ -155,8 +163,15 @@ LLM App Engineer 프로젝트로서 합리적인 순서. 아래는 **원안 그�
   - [x] 답변 정확성/Groundedness/Citation 정확성 — **171건 정식 실행 완료**(사건유형 22개
     커버, `build_typed_test_set.py`+`run_judge_compare.py`). chunks가 정확성 65.0%/
     groundedness 65.3%/인용정확성 72.9%/종합 64.9% 승률로 우세(p<0.001). 세무/특허
-    유형은 예외적으로 full이 우세(다수 판례 간 수치 혼동) — 유형별 라우팅은 미구현
-    ([log.md](log.md) 2026-08-31)
+    유형은 예외적으로 full이 우세(다수 판례 간 수치 혼동)했으나 **유형별 분기는 하지
+    않고 모든 유형에 chunks 동일 적용으로 최종 확정(2026-09-02)**
+    ([log.md](log.md) 2026-08-31). 이후 195건(hit 100+miss 100) GPT judge로 rubric
+    세분화(`grounded`+`resolves_question`) 재평가 — **실사용 정답률 73~78%**로 확인
+    (hit은 할루시네이션이 주 병목). **프롬프트 개선 시도(질문 먼저 파악 후 답변하라는
+    다단계 지시) → 195건 재평가 결과 전 지표 악화(hit resolves_question 89.0%→65.7%,
+    둘다 78.0%→59.6%) → 원복 결정.** 소형 모델(1.2B)은 복잡한 지시가 오히려 핵심 과제
+    수행을 방해한다는 교훈 확인. **reasoning EXAONE 모델 시도는 속도만 측정(7~7.5배 느림)
+    하고 정확도 검증 없이 최종 미채택으로 확정(2026-09-02)** — [log.md](log.md) 2026-09-01, 2026-09-02
   - [x] 답변 불가능한 질문 처리 — **조사 완료, 기능 자체의 실효성에 의문 제기로 결론.**
     threshold=0.2로 확정(hit손실:miss포착 누적비율이 0.3에서 역전되기 직전 지점).
     이후 `check_miss_rejection.py`+`eval_answer_quality.py`(GPT-5-mini, 라벨이 아니라
@@ -172,6 +187,11 @@ LLM App Engineer 프로젝트로서 합리적인 순서. 아래는 **원안 그�
     확장 안 됨.
 
 ### Phase 4 — 실무형 Backend / 운영 구조 구축
+
+> **스코프 아웃 결정(2026-09-02)**: 아래 항목들은 의도적으로 진행하지 않기로 확정.
+> 지금 배포된 상태(FastAPI + 채팅 기능, Vast.ai + supervisor/Caddy)를 포트폴리오
+> 프로젝트의 최종 완성 지점으로 간주 — [log.md](log.md) 2026-09-02 (계속3) 참고.
+
 - Backend 서비스 구조 정리
   - [ ] FastAPI / Router·Service 분리 / Request·Response schema / 예외 처리
   - ➕ **Streaming 응답 (SSE)**: 실제 LLM 서비스는 답변을 토큰 단위로 흘려보내는 게 표준 UX.
@@ -209,8 +229,11 @@ LLM App Engineer 프로젝트로서 합리적인 순서. 아래는 **원안 그�
 
 ## 5. 다음 계획 (Next Step)
 
-**지금 할 일**: 검색 파이프라인의 다음 개선 요소를 우선순위 정해서 진행 — 후보와 우선순위는
-아래 참고. Retriever 자체(chunking + 임베딩 파인튜닝)는 완료됨.
+**프로젝트 스코프는 2026-09-02에 마감됐음.** 아래 "다음 개선 후보"는 전부 역사적 기록으로
+남겨두되, 실제 다음 행동 지침은 이것뿐: **future work(3번, 사건번호 라우팅/MMR/메타데이터
+필터)만 향후 여유가 되면 재검토 가능**하고, 그 외(negative ablation, Phase 4 백엔드
+고도화, reasoning mode, 유형별 컨텍스트 분기)는 전부 의도적으로 진행하지 않기로 확정됨
+([log.md](log.md) 2026-09-02 (계속3), [DECISIONS.md](DECISIONS.md) 참고).
 
 **Chunking 최종 결정 요약** (완료, 2026-08-19~20, 상세 근거는 [log.md](log.md)):
 chunk200 → chunk1000 → chunk200_overlap50 → chunk300_overlap100까지 exact search + pgvector
@@ -247,16 +270,16 @@ Phase A보다 나빴음(false negative 추정) — `mine_hard_negatives.py --ski
    테스트(20개 샘플, 179ms) 결과와 비교해 recall 손해가 더 커 보여 **top_n=30 유지로
    잠정 결론**(UX 응답시간 기준 1초 미만이라 병목 아닐 걸로 판단). 근거: [log.md](log.md)
    2026-08-25.
-1. **negative 개수 ablation(미실행, 아이디어만 정리) — 다음 작업 후보.** reranker 학습에
-   지금 hard negative 4개+in-batch negative(기본 4개)를 같이 쓰는데, hard negative를
-   1개로 줄이거나 아예 빼고 in-batch만 쓰면 어떻게 되는지 비교 필요(재생성 없이
-   `reranker_pairs.jsonl`의 negative_chunks만 잘라 쓰면 됨) — dense Phase A→B 패턴상
-   줄이면 오히려 나빠질 걸로 예상되나 실측은 아직 안 함.
-2. **MMR(다양성 재정렬)** — v1에 있었던 요소(FAISS top-50→MMR→rerank top-3)인데
+0. ~~**negative 개수 ablation**~~ — **폐기(2026-09-02).** hard negative를 줄이면
+   오히려 나빠질 것이라는 추측만 있었고 실측 근거가 없던 아이디어였음. 더 이상 추진 안 함.
+1. **MMR(다양성 재정렬)** — v1에 있었던 요소(FAISS top-50→MMR→rerank top-3)인데
    v2엔 아직 없음. chunk 단위 검색이라 같은/비슷한 chunk가 상위권을 도배할 수 있어 v1보다
-   오히려 더 필요할 수 있음
-3. **메타데이터 필터 결합** — "형사 사건 중 2015년 이후" 같은 구조화 질의 처리 (SelfQuery
-   방식, LLM으로 필터+의미쿼리 분리 — 초반 논의 참고). 정확도보다는 실사용 기능 완성도 항목
+   오히려 더 필요할 수 있음. **→ future work로 유보(2026-09-02), 지금 스코프에서는 진행 안 함.**
+2. **메타데이터 필터 결합** — "형사 사건 중 2015년 이후" 같은 구조화 질의 처리 (SelfQuery
+   방식, LLM으로 필터+의미쿼리 분리 — 초반 논의 참고). **→ future work로 유보(2026-09-02).**
+3. **사건번호 정규식 라우팅** — "사건번호로 판례 찾아줘" 같은 정확 일치 질의를 벡터 검색
+   대신 정규식으로 감지해 DB 직접 조회하는 방식(2026-08-25 논의). **→ future work로
+   유보(2026-09-02).**
 4. **평가는 전부 `server/eval/run_eval.py`로** — 새 검색 방법마다 `retrievers.py`에
    Retriever 클래스만 추가하면 됨 (2026-08-20 하니스 신설, 상세는 아래)
 

@@ -2,6 +2,7 @@
 
 날짜순 기록. 상세 분석/근거가 긴 항목은 별도 문서로 빼고 여기서는 링크 + 한 줄 요약만 남김.
 새 세션은 [PROJECT_STATE.md](PROJECT_STATE.md)를 먼저 읽고, 여기서는 최근 항목 몇 개만 훑으면 됨.
+전체 흐름만 빠르게 보고 싶으면(세부 수치 없이 후보/결정/이유만) [DECISIONS.md](DECISIONS.md) 참고.
 
 ---
 
@@ -1087,3 +1088,176 @@ Phase 2 첫 작업으로 KURE-v1 도메인 파인튜닝 설계를 논의하고 1
 - **다음**: (1) "답변 불가능 처리"는 낮은 threshold(0.2) 1차 필터만 유지하고 LLM 자체
   거절 로직은 보류(신뢰도 낮음 확인됨), (2) 사건번호 정규식 라우팅 구현(병합 사건번호
   파일명 불일치 이슈도 이때 같이 처리), (3) MMR/메타데이터 필터로 진행.
+
+## 2026-09-01 (계속) — rubric 개선(grounded/resolves_question 분리)으로 재평가, 실사용 정답률은 73~78%가 더 정직한 수치
+
+- **문제 제기(사용자)**: 기존 `answer_correct`는 "판례 내용에 비추어 정확한가"만 물어서,
+  "판례 내용은 충실히 옮겼지만 정작 질문의 핵심 쟁점엔 제대로 답 안 함"인 경우를 놓칠 수
+  있음 — groundedness(할루시네이션 없음)와 실제 질문 해결 여부가 다른 축인데 뭉뚱그려져
+  있었음.
+- **`server/reeval_rubric_v2.py` 신설**: rubric을 `grounded`(판례 내용에 부합, 지어낸
+  거 없음)와 `resolves_question`(질문이 구체적으로 묻는 쟁점에 직접 대응해 정확한 결론을
+  냈는가)로 분리. **비용 최적화**: `actually_relevant`/`decline_justified`는 정의가 안
+  바뀌었으니 기존 195개 결과(`answer_quality_results.jsonl`)의 v1 판정을 그대로
+  재사용하고, 거절 케이스(답변 자체가 없음)는 GPT 호출을 아예 생략 — grounded/
+  resolves_question이 필요한, 실제로 답변을 생성한 185개에 대해서만 새로 GPT 호출.
+- **정식 결과**:
+
+  | | v1(answer_correct, 뭉뚱그림) | v2 grounded | v2 resolves_question | v2 둘다(진짜 정답) |
+  |---|---|---|---|---|
+  | hit (n=100) | 87.0% | 80.0% | 89.0% | **78.0%** |
+  | miss-미거절, 관련 있던 것 중 (n=85) | 77.6% | 77.6% | 82.4% | **72.9%** |
+
+  (miss-거절의 `decline_justified`는 정의 안 바뀌어서 1/10(10.0%)로 v1과 동일)
+- **결론**: rubric을 정교하게 나누니 v1보다 낮은 성공률이 나옴 — v1이 "판례에 충실하면"
+  관대하게 정답 처리했던 일부가 "질문 핵심은 안 짚었다"는 이유로 v2에서 걸러짐. **실사용
+  정답률은 73~78%가 더 정직한 수치.** 실패 원인도 카테고리별로 다름: hit은 grounded가
+  더 큰 병목(80% vs resolves 89% — 정답 문서가 있어도 할루시네이션이 주 원인), miss-미거절은
+  둘 다 비슷하게 문제(77.6%/82.4% — 라벨과 다른 차선책 문서로 답하다 보니 지어내는 것도,
+  핵심을 놓치는 것도 같이 늘어남).
+- **다음**: 답변 생성 품질 개선 방향 논의 — 아래 섹션 "생성 품질 개선 후보" 참고.
+
+## 2026-09-01 (계속2) — 프롬프트 개선 시도 실패(전 지표 악화), 원복 결정
+
+- **개선 방향 논의**: 답변 성능을 올릴 방법으로 (1) 더 큰/reasoning EXAONE 모델, (2) 프롬프트
+  개선, (3) self-verification 2차 패스, (4) 생성 모델 자체 파인튜닝 순으로 우선순위를
+  세우고, 가장 싸고 빠른 (2) 프롬프트 개선부터 실측.
+- **프롬프트 v2 시도**: `generate.py`의 `build_prompt()`에 "1. 질문이 구체적으로 무엇을
+  묻고 있는지 먼저 파악 2. 관련 있는 판례만 골라서 직접 답변, 무관한 판례는 억지로 언급
+  금지"라는 2단계 지시를 추가. 1개 샘플로는 "질문의 내용은 ~을 묻는 것입니다"처럼 의도한
+  구조로 답변이 나와서 긍정적으로 보였음.
+- **`server/eval_prompt_v2.py`로 195건(기존 hit 100+miss 100과 동일 쿼리셋) 정식
+  재평가** — `actually_relevant`는 프롬프트 무관이라 재사용, `decline_justified`는
+  `not actually_relevant`로 계산(GPT 호출 불필요), `grounded`/`resolves_question`만
+  새 답변으로 재판정.
+- **결과: 예상과 반대로 전 지표 악화**:
+
+  | | 기존 프롬프트 | 새 프롬프트 | 변화 |
+  |---|---|---|---|
+  | hit grounded | 80.0% | 74.7%(74/99) | -5.3%p |
+  | hit resolves_question | 89.0% | **65.7%(65/99)** | **-23.3%p** |
+  | hit 둘다(진짜 정답) | 78.0% | **59.6%(59/99)** | **-18.4%p** |
+  | miss-거절 decline_justified | 10.0%(1/10) | 0.0%(0/4) | -10%p |
+  | miss-미거절 grounded | 77.6% | 73.3%(66/90) | -4.3%p |
+  | miss-미거절 resolves_question | 82.4% | 73.3%(66/90) | -9.1%p |
+  | miss-미거절 둘다 | 72.9% | 65.6%(59/90) | -7.3%p |
+
+  (1건 실패로 hit n=99, miss-거절 n=4로 줄었으나 비율 비교엔 무리 없음)
+- **원인 추정**: `EXAONE-4.0-1.2B`(1.2B급 소형 모델)는 지시가 복잡해질수록(질문 파악→
+  관련 판례만 선별→직접 답변→무관 판례 언급 금지, 다단계 지시) 오히려 핵심 과제(질문에
+  직접 답하기)에 쓸 attention이 분산되는 것으로 추정 — 큰 모델이었다면 도움됐을 구조화
+  지시가 작은 모델에겐 부담으로 작용. hit의 resolves_question이 23%p나 떨어진 게 특히
+  이 가설과 부합.
+- **결정: 프롬프트를 원래(단순) 버전으로 원복.** `build_prompt()`를 되돌림
+  (`server/generate.py`) — 개선 시도가 실패했다는 것도 실측으로 검증된 값진 결과로 기록.
+  "작은 모델에겐 복잡한 지시보다 단순한 프롬프트가 낫다"는 교훈은 이후 프롬프트 수정
+  시도에도 참고할 것.
+- **다음**: 프롬프트 개선은 보류하고, 우선순위 1번이었던 "더 큰/reasoning EXAONE 모델"
+  방향으로 시도.
+
+## 2026-09-02 — reasoning mode 실측(7.5배 느림) → 배포로 전환: FastAPI 서비스 배포 + server/ 폴더 재구성
+
+- **EXAONE reasoning mode(`enable_thinking=True`) 실측**: `generate_answer()`에 `reasoning`
+  옵션 추가(모델 카드 권장대로 샘플링 temperature=0.6/top_p=0.95 사용). 답변 텍스트 안에
+  `</think>` 태그가 그대로 남는 걸 발견(skip_special_tokens로도 안 지워짐) — 태그 기준으로
+  분리해서 최종 답변만 반환하도록 처리. 정성적으로는 구조화가 잘 된 답변이 나왔으나,
+  **속도가 질문 1개당 7~7.5배 느림**(일반 3.4초 vs reasoning 24~26초, 검색까지 합치면
+  총 26~28초) — 정식 정확도 검증 전에 방향을 배포로 전환(사용자 판단).
+- **FastAPI 백엔드 배포**: `server/api.py` 신설 — `/health`, `/ask`(POST), `/`(간단한
+  HTML 데모 페이지, 질문 입력→결과 표시)를 제공. Streamlit 대신 FastAPI가 정적 페이지도
+  직접 서빙 — 이 인스턴스 디스크 여유가 1GB 안팎으로 빠듯해 Streamlit의 무거운 의존성
+  (pandas/pyarrow 등)을 피함(`fastapi`+`uvicorn`만 설치, 디스크 영향 미미). 모델은 서버
+  기동 시(`lifespan`) 한 번만 로드해서 요청마다 재사용.
+- **supervisor 서비스로 등록+외부 노출**: `/opt/supervisor-scripts/lexchatbot.sh`(wrapper)+
+  `/etc/supervisor/conf.d/lexchatbot.conf`로 등록, `/etc/portal.yaml`에 빈 포트(external
+  10100→internal 18100)로 Caddy 인증 엣지 뒤에 노출. 외부에서 토큰 인증(Bearer 헤더 /
+  `?token=` 쿼리 / Basic Auth `vastai:토큰` 전부 확인됨)으로 `/health`·`/ask` 정상 동작
+  확인. 데모 페이지의 JS `fetch('/ask')` 호출도 URL의 `?token=`을 그대로 실어 보내도록
+  보완(쿠키 인증에 안 기대고 명시적으로 넘김).
+- **`server/` 폴더 재구성 — 실제 서비스 코드와 연구/실험 스크립트 분리**:
+  - `server/service/` (신규) — 실제 배포 대상: `api.py`, `generate.py`
+  - `server/research/` (신규) — Phase 3 일회성 평가/실험 스크립트: `judge_compare.py`,
+    `run_judge_compare.py`, `check_miss_rejection.py`, `eval_answer_quality.py`,
+    `reeval_rubric_v2.py`, `eval_prompt_v2.py`, `build_typed_test_set.py` (+생성된 결과
+    jsonl들도 같이 이동)
+  - `server/eval/`(검색 평가 인프라, `retrievers.py` 등)는 그대로 유지 — `service`와
+    `research` 양쪽에서 공유하는 라이브러리라서 안 옮김
+  - 이동한 스크립트들이 참조하던 상대경로(`generate.py` import, `data/`, `eval/` 하위
+    파일들)를 전부 한 단계씩 다시 계산하도록 수정, `git mv`로 히스토리 보존
+  - 실제 떠 있던 `lexchatbot` supervisor 서비스의 wrapper 스크립트 경로도 같이 수정
+    (`cd server` → `cd server/service`) → 재시작 후 외부 접속까지 재검증 완료(끊김 없이 전환)
+- **다음**: 배포 데모 마무리 확인(사용자), 이후 Phase 3 나머지(사건번호 라우팅, MMR,
+  메타데이터 필터) 또는 reasoning mode 정식 정확도 검증 중 우선순위 선택.
+
+## 2026-09-02 (계속) — 디스크 정리 + 프로젝트 구조 문서화 + service 폴더를 최종 채택 기능만으로 재작성
+
+- **디스크 점검+정리**: `data/._DB_data`(macOS AppleDouble 잔재, 예전 정리 때 DB_data 상위
+  폴더 것 하나를 놓침), `server/finetune/reranker_pairs.jsonl`(163MB, reranker 학습
+  이미 완료돼서 재생성 가능한 파생 데이터), 이전 위치의 고아 `__pycache__` 캐시들 삭제 —
+  여유 공간 1004MB → 1.2GB. `server/requirements.txt`가 초기 상태 그대로라 그 사이 실제로
+  쓰게 된 `psycopg2-binary`/`kiwipiepy`/`datasets`/`fastapi`/`uvicorn`/`pydantic`/`openai`/
+  (참고용) `FlagEmbedding`/`scipy`가 빠져있던 것도 용도별로 구분해서 업데이트.
+- **`docs/STRUCTURE.md` 신설**: 폴더별로 각 파일의 용도를 정리한 참조 문서(의사결정 근거는
+  기존대로 log.md에, "무엇이 어디 있는지"만 이 문서가 담당).
+- **`server/service/`를 최종 채택 기능만으로 재작성**: `generate.py`는 비교했던 모든
+  선택지(문서 전체 vs chunks, 일반 vs reasoning mode, 원복된 프롬프트 v2 등)를 다 가진
+  실험용 버전이라 배포 코드에 안 어울린다는 문제 제기(사용자) — `server/research/`로
+  옮기고(연구 스크립트들과 같은 폴더가 되니 import용 `sys.path.insert` 우회 코드도
+  같이 제거해서 원래의 단순한 import로 복귀), `server/service/`엔 **최종 채택된 것만**
+  남긴 새 `pipeline.py`를 작성(문서 전체 컨텍스트/reasoning mode/구 프롬프트 전부 제거,
+  chunks 컨텍스트+일반 모드+원래 프롬프트만 남김, `answer_query()` 진입점 추가로 `api.py`
+  코드도 단순화). `lexchatbot` 서비스 재시작 후 외부 `/health`+`/ask` 재검증 완료(끊김 없이 전환).
+
+## 2026-09-02 (계속3) — 채팅 기능(라우터+멀티턴+UI) 추가, 버그 3건 발견/수정, 문서 정리, 프로젝트 스코프 최종 확정
+
+- **채팅 기능 확장**: 단발 질문-답변(`/ask`)에서 나아가 `/chat` 엔드포인트 신설.
+  `pipeline.py`에 `ROUTER_SYSTEM`(이번 메시지가 새 판례 검색이 필요한 SEARCH인지, 일반
+  대화/재질문인 DIRECT인지 EXAONE 자신에게 분류시킴) + `classify_query()` +
+  `answer_chat()`(멀티턴 히스토리를 그대로 모델에 넘겨 재질문 처리, 서버 세션 저장 없이
+  클라이언트가 매번 전체 히스토리를 재전송하는 stateless 설계) 추가. `api.py`의 데모
+  페이지도 기본 채팅 UI(내 질문 오른쪽 말풍선/답변 왼쪽 말풍선, 하단 입력창)로 재작성.
+- **버그 1 — 라우터 오분류**: 실제 법률 질문("진정성립이 인정되는 처분문서는 증명력이
+  있는가?")이 DIRECT로 잘못 분류돼 검색 없이 근거 없는 답변이 나오는 사례 발견(디버그
+  스크립트로 EXAONE 원본 출력이 실제로 `'DIRECT'`였음을 확인, 파싱 버그 아님). `ROUTER_SYSTEM`에
+  few-shot 예시 + "판단이 애매하면 반드시 SEARCH를 선택하세요" 편향 문구를 추가해 수정,
+  5문항 테스트+실제 `/chat` 왕복으로 재검증 완료.
+- **버그 2 — 한글 입력 시 답변 중복 전송**: 사용자가 "두 번째 질문부터 마지막 글자가
+  추가로 들어가고 답변이 2번 나온다"고 보고. 원인: 한글 IME로 마지막 글자를 조합
+  중인 상태에서 Enter를 누르면 브라우저가 keydown을 두 번(조합 확정용 + 실제 Enter)
+  발생시킬 수 있는데, `inputEl`의 keydown 핸들러가 `e.key === 'Enter'`만 보고 있어서
+  둘 다 `send()`를 트리거함. `!e.isComposing` 가드를 추가해 조합 중 이벤트를 무시하도록
+  수정(`api.py` DEMO_PAGE JS).
+- **버그 3 — 무관한 대화에 대한 판례 조작(hallucination)**: 실제 대화 재현
+  (법률 질문→요약 요청→"글쿤 잠온다" 같은 잡담)으로 확인. 원인: 버그 1 수정 때 넣은
+  "애매하면 SEARCH" 편향 때문에 순수 잡담에도 검색이 걸렸는데, reranker top1 점수가
+  0.002로 극히 낮은데도(2026-08-31에 실측해둔 threshold=0.2보다 훨씬 낮음) 이 안전장치가
+  실제 서비스 코드(`pipeline.py`)엔 연결이 안 돼 있어서, 모델이 검색된 무관한 문서 5개는
+  무시하고 학습 때 외운 그럴듯한 가짜 판례번호로 답을 지어냄(실제 인용된 case_no와 답변
+  본문의 판례번호가 서로 다름을 확인). **수정**: `retrieve_top_k_with_score()`(기존
+  `retrieve_batch_with_scores` 재사용) + `RERANK_NO_MATCH_THRESHOLD=0.2` 상수 +
+  `NO_MATCH_ANSWER` 고정 응답을 `answer_query`/`answer_chat` 양쪽에 연결 — top1 점수가
+  threshold 미만이면 검색 결과를 컨텍스트로 안 쓰고 확정 거절 응답. 재현 시나리오로
+  재검증(거절 응답 확인) + 정상 법률 질문 회귀 테스트(정상 인용 확인) 완료.
+- **새 대화 버튼 추가**: 헤더에 "새 대화" 버튼 — `history` 배열과 채팅 화면을 초기화해서
+  새 대화로 넘어갈 수 있게 함.
+- **`README.md`(신규, 최상위)**: 프로젝트 소개, 아키텍처 다이어그램, 기술 스택, 실행 방법.
+- **`docs/DECISIONS.md`(신규)**: log.md가 너무 길어져서, 세부 수치 없이 "후보→결정→이유"
+  흐름만 보는 요약 문서 신설(13개 결정 지점). `STRUCTURE.md`/`log.md` 상단에 상호 링크 추가.
+- **프로젝트 스코프 최종 확정 (사용자 결정)**:
+  1. **Reasoning mode는 최종 미채택.** 속도만 측정(7~7.5배 느림)하고 정확도 검증은
+     안 했는데, 정확도까지 검증하지 않고 이대로 배포 유지하기로 확정 — 추가 조사 없음.
+  2. **세무/특허 유형도 분리하지 않고 전부 chunks(매칭 chunk+앞뒤)로 통일.** 171건
+     비교에서 이 두 유형만 예외적으로 full이 우세했던 신호가 있었지만, 유형별 분기는
+     구현하지 않고 모든 유형에 동일한 방식 적용하기로 확정.
+  3. **사건번호 정규식 라우팅 / MMR(다양성 재정렬) / 메타데이터 필터 결합은 future
+     work로 유보.** 지금 스코프에서는 진행하지 않되, 백로그에는 남겨둠(나중에 여유가
+     되면 재검토 가능).
+  4. **reranker hard negative 개수 ablation 가설은 폐기.** "hard negative를 줄이면
+     오히려 나빠질 것"이라는 추측만 있었고 실측 근거가 없었던 아이디어 — 더 이상
+     추진하지 않음(2026-08-25 항목에 남은 기록은 역사적 기록으로만 유지, 백로그에서는 제거).
+  5. **Phase 4(백엔드 고도화: 세션 저장, 입력 검증/에러 처리, 로깅/모니터링, rate
+     limiting, streaming, Docker화, AWS 배포)는 여기서 스코프를 닫음.** 지금 배포된
+     상태(FastAPI + 채팅 기능 + supervisor/Caddy 노출)를 포트폴리오 프로젝트의 최종
+     완성 지점으로 간주하고, 이 항목들은 의도적으로 진행하지 않기로 결정.
+- **다음**: (공식적으로 없음 — 위 5번 결정에 따라 프로젝트 스코프를 여기서 마감. 3번
+  항목만 향후 여유가 되면 재검토 가능한 future work로 남음.)

@@ -19,9 +19,9 @@ from collections import Counter, defaultdict
 
 import psycopg2
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # server/
-VAL_PATH = os.path.join(BASE_DIR, "..", "data", "Val", "val_query.json")
-OUT_PATH = os.path.join(BASE_DIR, "..", "data", "Val", "val_query_by_type.json")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # server/research/
+VAL_PATH = os.path.join(BASE_DIR, "..", "..", "data", "Val", "val_query.json")
+OUT_PATH = os.path.join(BASE_DIR, "..", "..", "data", "Val", "val_query_by_type.json")
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://postgres:lexchatbot_dev@127.0.0.1:5432/lexchatbot")
 TABLE = "chunks_300_overlap100"

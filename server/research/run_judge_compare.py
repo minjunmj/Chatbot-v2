@@ -28,8 +28,8 @@ from generate import (
 )
 from judge_compare import call_judge
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # server/
-TYPED_VAL_PATH = os.path.join(BASE_DIR, "..", "data", "Val", "val_query_by_type.json")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # server/research/
+TYPED_VAL_PATH = os.path.join(BASE_DIR, "..", "..", "data", "Val", "val_query_by_type.json")
 DEFAULT_OUT_PATH = os.path.join(BASE_DIR, "judge_results.jsonl")
 
 CRITERIA = ("more_accurate", "more_grounded", "more_correct_citation", "overall_better")

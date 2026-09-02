@@ -24,17 +24,19 @@ import numpy as np
 import torch
 from sentence_transformers import SentenceTransformer
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "eval"))
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # server/research/
+SERVER_DIR = os.path.join(BASE_DIR, "..")  # server/
+
+sys.path.insert(0, os.path.join(SERVER_DIR, "eval"))
 from retrievers import CrossEncoderReranker, l2norm  # noqa: E402
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # server/
-DB_DATA_DIR = os.path.join(BASE_DIR, "..", "data", "DB_data")
-VAL_PATH = os.path.join(BASE_DIR, "..", "data", "Val", "val_query.json")
+DB_DATA_DIR = os.path.join(SERVER_DIR, "..", "data", "DB_data")
+VAL_PATH = os.path.join(SERVER_DIR, "..", "data", "Val", "val_query.json")
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://postgres:lexchatbot_dev@127.0.0.1:5432/lexchatbot")
 TABLE = "chunks_300_overlap100"
-DENSE_MODEL_PATH = os.path.join(BASE_DIR, "finetune", "output", "kure-v1-finetuned-hard")
-RERANK_MODEL_PATH = os.path.join(BASE_DIR, "finetune", "output", "bge-reranker-v2-m3-finetuned")
+DENSE_MODEL_PATH = os.path.join(SERVER_DIR, "finetune", "output", "kure-v1-finetuned-hard")
+RERANK_MODEL_PATH = os.path.join(SERVER_DIR, "finetune", "output", "bge-reranker-v2-m3-finetuned")
 LLM_PATH = "LGAI-EXAONE/EXAONE-4.0-1.2B"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -126,6 +128,11 @@ def build_context_chunks(dense_model, conn, case_nos, query, window=CHUNK_WINDOW
 
 
 def build_prompt(query, context):
+    # 2026-09-01: "질문을 먼저 파악하고 그것에 직접 답하라"는 다단계 지시를 추가한 v2를
+    # 195건 정식 비교했더니 오히려 전 지표 악화(hit resolves_question 89.0%→65.7%,
+    # 둘다(진짜 정답) 78.0%→59.6% 등, docs/log.md 참고) — EXAONE-4.0-1.2B처럼 작은
+    # 모델은 지시가 복잡해질수록 오히려 핵심(질문에 직접 답하기)에 쓸 주의력이 분산되는
+    # 것으로 추정. 원래의 단순한 프롬프트로 되돌림.
     return (
         "당신은 한국 법률 판례를 근거로 답변하는 법률 어시스턴트입니다. "
         "아래 제공된 판례들만 근거로 삼아 질문에 답하세요. "
@@ -138,14 +145,30 @@ def build_prompt(query, context):
 
 # ---------- 생성 ----------
 
-def generate_answer(tokenizer, llm, query, context, max_new_tokens=1024):
+def generate_answer(tokenizer, llm, query, context, max_new_tokens=1024, reasoning=False):
+    """reasoning=True면 EXAONE-4.0의 hybrid reasoning mode를 켬(`enable_thinking=True`).
+    프롬프트에 다단계 지시를 직접 써넣는 방식(2026-09-01, 실패)과 달리, 모델 자체의
+    내장 사고 과정을 쓰는 거라 "작은 모델이 복잡한 지시에 혼란스러워하는" 문제를 피할
+    가능성이 있음 — docs/log.md 참고. reasoning mode는 모델 카드 권장대로 그리디가 아닌
+    샘플링(temperature=0.6, top_p=0.95)을 씀."""
     prompt = build_prompt(query, context)
     messages = [{"role": "user", "content": prompt}]
     input_ids = tokenizer.apply_chat_template(
-        messages, tokenize=True, add_generation_prompt=True, return_tensors="pt", return_dict=False
+        messages, tokenize=True, add_generation_prompt=True, return_tensors="pt", return_dict=False,
+        enable_thinking=reasoning,
     ).to(llm.device)
-    output = llm.generate(input_ids, max_new_tokens=max_new_tokens, do_sample=False)
-    return tokenizer.decode(output[0][input_ids.shape[1]:], skip_special_tokens=True)
+    gen_kwargs = {"max_new_tokens": max_new_tokens}
+    if reasoning:
+        gen_kwargs.update(do_sample=True, temperature=0.6, top_p=0.95)
+    else:
+        gen_kwargs.update(do_sample=False)
+    output = llm.generate(input_ids, **gen_kwargs)
+    decoded = tokenizer.decode(output[0][input_ids.shape[1]:], skip_special_tokens=True)
+    if reasoning and "</think>" in decoded:
+        # enable_thinking=True면 사고 과정과 최종 답변이 </think>로만 구분된 채 하나의
+        # 텍스트로 나옴(skip_special_tokens로도 안 지워짐, 실측 확인) — 최종 답변만 반환
+        decoded = decoded.split("</think>", 1)[1].strip()
+    return decoded
 
 
 def main():
@@ -154,6 +177,7 @@ def main():
     parser.add_argument("--query", type=str, default=None, help="직접 쿼리 입력(지정 시 --index 무시)")
     parser.add_argument("--top-k", type=int, default=TOP_K)
     parser.add_argument("--context-mode", choices=["full", "chunks"], default="full")
+    parser.add_argument("--reasoning", action="store_true", help="EXAONE-4.0 reasoning mode 사용")
     args = parser.parse_args()
 
     if args.query:
@@ -179,7 +203,8 @@ def main():
         context = build_context_chunks(dense_model, conn, ranked, query)
 
     print("답변 생성 중...")
-    answer = generate_answer(tokenizer, llm, query, context)
+    max_new = 2048 if args.reasoning else 1024  # reasoning 과정이 토큰을 더 씀
+    answer = generate_answer(tokenizer, llm, query, context, max_new_tokens=max_new, reasoning=args.reasoning)
 
     print("\n===== 답변 =====")
     print(answer)
