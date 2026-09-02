@@ -48,6 +48,10 @@ ios/
 /server/research/answer_quality_results_v2.jsonl
 /server/research/prompt_v2_results.jsonl
 
+# ---- docs (비공개, 로컬 전용) ----
+/docs/log.md
+/docs/PROJECT_STATE.md
+
 # ---- 기타 ----
 .env
 /data/

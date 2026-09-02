@@ -49,14 +49,11 @@
 | 백엔드 | FastAPI |
 | 배포 | Vast.ai GPU 인스턴스, supervisor + Caddy 인증 엣지 |
 
-각 선택의 후보와 근거는 [docs/DECISIONS.md](docs/DECISIONS.md)에 큰 흐름으로,
-세부 수치는 [docs/log.md](docs/log.md)에 날짜순으로 정리돼 있습니다.
+각 선택의 후보와 근거는 [docs/DECISIONS.md](docs/DECISIONS.md)에 정리돼 있습니다.
 
 ## 프로젝트 문서
 
 - [docs/DECISIONS.md](docs/DECISIONS.md) — 전체 프로젝트 흐름 요약 (후보 → 결정 → 이유, 세부 수치 제외)
-- [docs/log.md](docs/log.md) — 모든 실험/결정의 날짜순 상세 기록 (수치, 원인 분석 포함)
-- [docs/PROJECT_STATE.md](docs/PROJECT_STATE.md) — 현재 상태 스냅샷 + 다음 계획
 - [docs/STRUCTURE.md](docs/STRUCTURE.md) — 폴더/파일별 용도 참조
 
 ## 폴더 구조 (요약)
